@@ -589,7 +589,7 @@ async def _stream_responses_api(chat_payload: dict, headers: dict):
         "part": {"type": "output_text", "text": ""},
     })
 
-    max_retries = 3
+    max_retries = 5
     client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0))
     try:
         for attempt in range(max_retries):
@@ -601,63 +601,74 @@ async def _stream_responses_api(chat_payload: dict, headers: dict):
                     headers=headers,
                 ) as resp:
                     if resp.status_code != 200:
-                        error_body = await resp.aread()
-                        error_msg = f"HTTP {resp.status_code}: {error_body.decode()}"
+                        body = await resp.aread()
+                        error_msg = (
+                            f"HTTP {resp.status_code}:"
+                            f" {body.decode()}"
+                        )
                         logger.error("Upstream returned %s", error_msg)
-                    else:
-                        async for line in resp.aiter_lines():
-                            if not line.strip() or not line.startswith("data: "):
-                                continue
-                            data_str = line[6:].strip()
-                            if data_str == "[DONE]":
-                                upstream_completed = True
-                                break
-                            try:
-                                chat_chunk = json.loads(data_str)
-                                choices = chat_chunk.get("choices", [])
+                        break
 
-                                if chunk_usage := chat_chunk.get("usage"):
-                                    usage = chunk_usage
+                    async for line in resp.aiter_lines():
+                        if (not line.strip()
+                                or not line.startswith("data: ")):
+                            continue
+                        data_str = line[6:].strip()
+                        if data_str == "[DONE]":
+                            upstream_completed = True
+                            break
+                        try:
+                            chat_chunk = json.loads(data_str)
+                        except json.JSONDecodeError as e:
+                            logger.warning(
+                                "Upstream chunk parse"
+                                " error: %.200s -> %s",
+                                data_str, e,
+                            )
+                            continue
 
-                                if not choices:
-                                    continue
-                                delta = choices[0].get("delta", {})
+                        if chunk_usage := chat_chunk.get("usage"):
+                            usage = chunk_usage
+                        choices = chat_chunk.get("choices", [])
+                        if not choices:
+                            continue
+                        delta_text = (
+                            choices[0].get("delta", {})
+                            .get("content", "")
+                        )
+                        if not delta_text:
+                            continue
 
-                                if delta_text := delta.get("content", ""):
-                                    full_text += delta_text
-                                    if not tc_detected:
-                                        tc_tag = "<minimax:tool_call>"
-                                        tc_pos = full_text.find(tc_tag)
-                                        if tc_pos >= 0:
-                                            tc_detected = True
-                                            safe_end = tc_pos
-                                        elif "</minimax:tool_call>" in full_text:
-                                            tc_detected = True
-                                            safe_end = sent_pos
-                                        else:
-                                            safe_end = max(
-                                                sent_pos,
-                                                len(full_text) - len(tc_tag),
-                                            )
-                                        unsent = full_text[sent_pos:safe_end]
-                                        if unsent:
-                                            yield sse(
-                                                "response.output_text.delta",
-                                                {
-                                                    "type": "response.output_text.delta",
-                                                    "item_id": msg_id,
-                                                    "output_index": 0,
-                                                    "content_index": 0,
-                                                    "delta": unsent,
-                                                },
-                                            )
-                                            sent_pos = safe_end
+                        full_text += delta_text
+                        if tc_detected:
+                            continue
 
-                            except json.JSONDecodeError as e:
-                                logger.warning(
-                                    "Upstream chunk parse error: %.200s -> %s",
-                                    data_str, e,
-                                )
+                        tc_tag = "<minimax:tool_call>"
+                        tc_pos = full_text.find(tc_tag)
+                        if tc_pos >= 0:
+                            tc_detected = True
+                            safe_end = tc_pos
+                        elif "</minimax:tool_call>" in full_text:
+                            tc_detected = True
+                            safe_end = sent_pos
+                        else:
+                            safe_end = max(
+                                sent_pos,
+                                len(full_text) - len(tc_tag),
+                            )
+                        unsent = full_text[sent_pos:safe_end]
+                        if unsent:
+                            yield sse(
+                                "response.output_text.delta",
+                                {
+                                    "type": "response.output_text.delta",
+                                    "item_id": msg_id,
+                                    "output_index": 0,
+                                    "content_index": 0,
+                                    "delta": unsent,
+                                },
+                            )
+                            sent_pos = safe_end
                 break
             except (httpx.ConnectError, httpx.ConnectTimeout) as e:
                 if full_text:
@@ -668,15 +679,19 @@ async def _stream_responses_api(chat_payload: dict, headers: dict):
                     )
                     break
                 if attempt < max_retries - 1:
-                    wait = 2 ** attempt
+                    wait = 2 ** (attempt - 2) if attempt >= 2 else 0
                     logger.warning(
                         "Connect error (attempt %d/%d), retrying in %ds: %s",
                         attempt + 1, max_retries, wait, e,
                     )
-                    await asyncio.sleep(wait)
+                    if wait:
+                        await asyncio.sleep(wait)
                 else:
                     error_msg = f"Connect failed after {max_retries} attempts: {e}"
                     logger.error(error_msg)
+    except httpx.ReadTimeout as e:
+        error_msg = str(e)
+        logger.warning("Upstream read timeout: %s", e)
     except Exception as e:
         error_msg = str(e)
         logger.exception("Upstream streaming error")
@@ -692,8 +707,8 @@ async def _stream_responses_api(chat_payload: dict, headers: dict):
     malformed_reason = _detect_malformed_tool_call(full_text, minimax_calls)
     if malformed_reason:
         logger.warning(
-            "Malformed tool call in stream: %s | raw=%.500s",
-            malformed_reason, full_text,
+            "Malformed tool call in stream: %s | len=%d",
+            malformed_reason, len(full_text),
         )
         minimax_calls = []
         clean_text = _strip_tc_fragments(clean_text)
