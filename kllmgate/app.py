@@ -1,0 +1,85 @@
+"""FastAPI 实例创建与路由注册"""
+
+from __future__ import annotations
+
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+from .config import load_config
+from .errors import GatewayError, format_error_response
+from .models import ProtocolFormat
+from .pipeline import process_request
+from .upstream.client import UpstreamClient
+
+logger = logging.getLogger(__name__)
+
+
+def create_app(config_path: str = "config.toml") -> FastAPI:
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        providers = load_config(config_path)
+        clients: dict[str, UpstreamClient] = {}
+        for name, cfg in providers.items():
+            clients[name] = UpstreamClient(cfg)
+            logger.info(
+                "Initialized upstream client: %s (%s)",
+                name, cfg.protocol_format.value,
+            )
+        app.state.providers = providers
+        app.state.upstream_clients = clients
+        yield
+        for client in clients.values():
+            await client.close()
+
+    app = FastAPI(title="kllmgate", lifespan=lifespan)
+
+    @app.post("/openai/chat/completions")
+    async def openai_chat(request: Request):
+        try:
+            body = await request.json()
+            return await process_request(
+                ProtocolFormat.OPENAI_CHAT,
+                body,
+                request.app.state.providers,
+                request.app.state.upstream_clients,
+            )
+        except GatewayError as e:
+            return format_error_response(
+                e, ProtocolFormat.OPENAI_CHAT,
+            )
+
+    @app.post("/openai/responses")
+    async def openai_responses(request: Request):
+        try:
+            body = await request.json()
+            return await process_request(
+                ProtocolFormat.OPENAI_RESPONSES,
+                body,
+                request.app.state.providers,
+                request.app.state.upstream_clients,
+            )
+        except GatewayError as e:
+            return format_error_response(
+                e, ProtocolFormat.OPENAI_RESPONSES,
+            )
+
+    @app.post("/anthropic/v1/messages")
+    async def anthropic_messages(request: Request):
+        try:
+            body = await request.json()
+            return await process_request(
+                ProtocolFormat.ANTHROPIC_MESSAGES,
+                body,
+                request.app.state.providers,
+                request.app.state.upstream_clients,
+            )
+        except GatewayError as e:
+            return format_error_response(
+                e, ProtocolFormat.ANTHROPIC_MESSAGES,
+            )
+
+    return app
