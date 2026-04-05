@@ -2,9 +2,12 @@
 
 import argparse
 import logging
+import os
 import sys
 
 import uvicorn
+
+_DEFAULT_CONFIG = os.environ.get("KLLMGATE_CONFIG", "config.toml")
 
 
 def main():
@@ -12,8 +15,11 @@ def main():
         description="kllmgate - 通用 LLM API 协议转换网关",
     )
     parser.add_argument(
-        "--config", default="config.toml",
-        help="配置文件路径（默认: config.toml）",
+        "--config", default=_DEFAULT_CONFIG,
+        help=(
+            "配置文件路径"
+            "（默认: $KLLMGATE_CONFIG 或 config.toml）"
+        ),
     )
     parser.add_argument(
         "--host", default="0.0.0.0",
