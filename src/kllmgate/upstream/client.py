@@ -57,12 +57,12 @@ class UpstreamClient:
                 resp = await self._client.post(
                     self._endpoint, json=body, headers=headers,
                 )
-            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            except httpx.RequestError as e:
                 last_error = e
                 if attempt < self.config.max_retries:
                     wait = self._backoff(attempt)
                     logger.warning(
-                        "Connect error (attempt %d/%d), "
+                        "Request error (attempt %d/%d), "
                         "retrying in %.1fs: %s",
                         attempt + 1,
                         self.config.max_retries + 1,
@@ -71,9 +71,9 @@ class UpstreamClient:
                     await asyncio.sleep(wait)
                     continue
                 raise UpstreamError(
-                    f"connect failed after {self.config.max_retries + 1}"
+                    f"request failed after {self.config.max_retries + 1}"
                     f" attempts: {e}",
-                    code="upstream_connect_error",
+                    code="upstream_request_error",
                 ) from e
 
             if resp.status_code in _RETRYABLE_STATUS_CODES:
@@ -98,7 +98,7 @@ class UpstreamClient:
 
         raise UpstreamError(
             f"exhausted retries: {last_error}",
-            code="upstream_connect_error",
+            code="upstream_request_error",
         )
 
     async def send_stream(
@@ -148,12 +148,12 @@ class UpstreamClient:
                 async for event in parse_sse_events(_line_iter()):
                     yield event
                 return
-            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            except httpx.RequestError as e:
                 last_error = e
                 if attempt < self.config.max_retries:
                     wait = self._backoff(attempt)
                     logger.warning(
-                        "Stream connect error (attempt %d/%d), "
+                        "Stream request error (attempt %d/%d), "
                         "retrying in %.1fs: %s",
                         attempt + 1,
                         self.config.max_retries + 1,
@@ -163,9 +163,9 @@ class UpstreamClient:
                     await asyncio.sleep(wait)
                     continue
                 raise UpstreamError(
-                    f"stream connect failed after "
+                    f"stream request failed after "
                     f"{self.config.max_retries + 1} attempts: {e}",
-                    code="upstream_connect_error",
+                    code="upstream_request_error",
                 ) from e
             finally:
                 if resp is not None:
@@ -173,7 +173,7 @@ class UpstreamClient:
 
         raise UpstreamError(
             f"stream exhausted retries: {last_error}",
-            code="upstream_connect_error",
+            code="upstream_request_error",
         )
 
     async def close(self):

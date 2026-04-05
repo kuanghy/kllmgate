@@ -157,6 +157,7 @@ class OpenaiResponsesToAnthropicMessagesConverter(Converter):
         })
 
         full_text = ""
+        usage: dict = {}
 
         async for event in upstream_events:
             if not event.event:
@@ -170,6 +171,8 @@ class OpenaiResponsesToAnthropicMessagesConverter(Converter):
                 msg = data.get("message", {})
                 model_name = msg.get("model", "")
                 response_obj["model"] = model_name
+                if isinstance(msg.get("usage"), dict):
+                    usage.update(msg["usage"])
 
             elif event.event == "content_block_delta":
                 delta = data.get("delta", {})
@@ -183,6 +186,10 @@ class OpenaiResponsesToAnthropicMessagesConverter(Converter):
                         "content_index": 0,
                         "delta": text,
                     })
+
+            elif event.event == "message_delta":
+                if isinstance(data.get("usage"), dict):
+                    usage.update(data["usage"])
 
             elif event.event == "message_stop":
                 yield sse("response.output_text.done", {
@@ -212,14 +219,13 @@ class OpenaiResponsesToAnthropicMessagesConverter(Converter):
                     "output_index": 0,
                     "item": completed_msg,
                 })
+                resp_usage = chat_usage_to_responses(
+                    anthropic_usage_to_chat(usage),
+                )
                 response_obj.update({
                     "status": "completed",
                     "output": [completed_msg],
-                    "usage": {
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "total_tokens": 0,
-                    },
+                    "usage": resp_usage,
                 })
                 yield sse("response.completed", {
                     "type": "response.completed",

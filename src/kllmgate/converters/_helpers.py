@@ -19,55 +19,76 @@ def now_ts() -> int:
     return int(time.time())
 
 
-def convert_content_part(part: dict) -> str:
-    """将单个 content part 转为纯文本"""
+def normalize_text_content(content) -> str:
+    """将 content 规范化为纯文本字符串
+
+    支持 str（直接返回）和 list（提取 text 块并拼接）两种输入。
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                if item.get("type") in ("text", "input_text", "output_text"):
+                    parts.append(item.get("text", ""))
+        return "\n".join(parts)
+    return str(content)
+
+
+def merge_chat_content(prev_content, curr_content):
+    """合并两个 Chat completions 的 content
+
+    处理 str+str, list+str, str+list, list+list 各种情况
+    """
+    if isinstance(prev_content, str) and isinstance(curr_content, str):
+        return f"{prev_content}\n\n{curr_content}"
+
+    prev_list = (
+        prev_content if isinstance(prev_content, list)
+        else [{"type": "text", "text": prev_content}]
+    )
+    curr_list = (
+        curr_content if isinstance(curr_content, list)
+        else [{"type": "text", "text": curr_content}]
+    )
+    return prev_list + curr_list
+
+
+def _responses_part_to_chat(part: dict) -> dict:
+    """将 Responses API 内容块映射为 Chat Completions content part"""
     part_type = part.get("type", "")
-
     if part_type in ("text", "input_text", "output_text"):
-        return part.get("text", "")
-    if part_type == "image_url":
-        url = part.get("image_url", {})
-        if isinstance(url, str):
-            return f"[image: {url}]"
-        return (
-            f'[image: {url.get("url", "unknown")} '
-            f'detail={url.get("detail", "auto")}]'
-        )
-    if part_type == "image":
-        image_url = part.get("image_url") or part.get("url", "")
-        file_id = part.get("file_id", "")
-        if image_url:
-            return f"[image: {image_url}]"
-        if file_id:
-            return f"[image file: {file_id}]"
-        return "[image]"
-    if part_type in ("input_audio", "audio"):
-        transcript = part.get("transcript", "")
-        audio_id = part.get("id", part.get("file_id", ""))
-        if transcript:
-            return f"[audio transcript: {transcript}]"
-        if audio_id:
-            return f"[audio: {audio_id}]"
-        return "[audio]"
-    if part_type == "file":
-        file_id = part.get("file_id", part.get("id", ""))
-        filename = part.get("filename", "")
-        return f"[file: {filename or file_id or 'unknown'}]"
-    if part_type == "refusal":
-        return part.get("refusal", "[refusal]")
-
-    return str(part)
+        return {"type": "text", "text": part.get("text", "")}
+    if part_type == "input_image":
+        return {
+            "type": "image_url",
+            "image_url": part.get("image_url", {}),
+        }
+    if part_type == "input_audio":
+        return {
+            "type": "input_audio",
+            "input_audio": part.get("input_audio", {}),
+        }
+    if part_type == "input_file":
+        return {
+            "type": "file",
+            "file": part.get("file", part.get("input_file", {})),
+        }
+    return part
 
 
-def convert_content_list(content: list) -> str:
-    """将 content 列表转为纯文本"""
+def convert_content_to_chat_parts(content: list) -> list[dict]:
+    """将 Responses API content list 映射为 Chat content parts 格式"""
     parts = []
     for item in content:
         if isinstance(item, str):
-            parts.append(item)
+            parts.append({"type": "text", "text": item})
         elif isinstance(item, dict):
-            parts.append(convert_content_part(item))
-    return "\n".join(parts)
+            parts.append(_responses_part_to_chat(item))
+    return parts
 
 
 FINISH_REASON_TO_STATUS = {

@@ -1139,3 +1139,374 @@ class TestOpenaiResponsesToolAdaptConverter:
         assert "response.function_call_arguments.delta" in full
         assert "search" in full
         assert "<minimax:tool_call>" not in full
+
+
+# ──────── Review 修复：流式 usage、缓冲、多模态、system list ────────
+
+
+class TestStreamUsageResponsesToAnthropic:
+    """跨协议流式 usage 修复：Responses->Anthropic 上游"""
+
+    def setup_method(self):
+        self.converter = OpenaiResponsesToAnthropicMessagesConverter(
+            AnthropicToolAdapter(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_stream_usage_from_anthropic_events(self):
+        events = [
+            SseEvent("message_start", json.dumps({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude",
+                    "content": [],
+                    "usage": {"input_tokens": 42, "output_tokens": 0},
+                },
+            }), []),
+            SseEvent("content_block_delta", json.dumps({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "Hi"},
+            }), []),
+            SseEvent("message_delta", json.dumps({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 7},
+            }), []),
+            SseEvent("message_stop", json.dumps({
+                "type": "message_stop",
+            }), []),
+        ]
+        chunks = await _collect_stream(self.converter, events)
+        full = "".join(chunks)
+        assert "response.completed" in full
+        completed_data = None
+        for chunk in chunks:
+            if "response.completed" in chunk:
+                for line in chunk.split("\n"):
+                    if line.startswith("data: "):
+                        completed_data = json.loads(line[6:])
+        assert completed_data is not None
+        usage = completed_data["response"]["usage"]
+        assert usage["input_tokens"] == 42
+        assert usage["output_tokens"] == 7
+        assert usage["total_tokens"] == 49
+
+
+class TestStreamUsageAnthropicToResponses:
+    """跨协议流式 usage 修复：Anthropic->Responses 上游"""
+
+    def setup_method(self):
+        self.converter = AnthropicMessagesToOpenaiResponsesConverter(
+            StandardToolAdapter(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_stream_usage_from_responses_events(self):
+        events = [
+            SseEvent("response.created", json.dumps({
+                "type": "response.created",
+                "response": {
+                    "id": "resp_1",
+                    "object": "response",
+                    "model": "gpt-4.1",
+                    "status": "in_progress",
+                    "output": [],
+                },
+            }), []),
+            SseEvent("response.output_text.delta", json.dumps({
+                "type": "response.output_text.delta",
+                "delta": "Hello",
+            }), []),
+            SseEvent("response.completed", json.dumps({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "object": "response",
+                    "model": "gpt-4.1",
+                    "status": "completed",
+                    "output": [],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "total_tokens": 15,
+                    },
+                },
+            }), []),
+        ]
+        chunks = await _collect_stream(self.converter, events)
+        full = "".join(chunks)
+        assert "message_delta" in full
+        for chunk in chunks:
+            if "message_delta" in chunk and "output_tokens" in chunk:
+                for line in chunk.split("\n"):
+                    if line.startswith("data: "):
+                        data = json.loads(line[6:])
+                        if data.get("type") == "message_delta":
+                            assert data["usage"]["output_tokens"] == 5
+
+
+class TestStreamBufferSizeProperty:
+    """stream_buffer_size 属性：标准适配器为 0，MiniMax 为 19"""
+
+    def test_standard_adapter_no_buffer(self):
+        assert StandardToolAdapter().stream_buffer_size == 0
+
+    def test_anthropic_adapter_no_buffer(self):
+        assert AnthropicToolAdapter().stream_buffer_size == 0
+
+    def test_minimax_adapter_has_buffer(self):
+        adapter = MinimaxXmlToolAdapter()
+        assert adapter.stream_buffer_size == len("<minimax:tool_call>")
+
+    @pytest.mark.asyncio
+    async def test_standard_adapter_no_delay(self):
+        """标准适配器流式时文本不应被延迟"""
+        converter = OpenaiChatToolAdaptConverter(StandardToolAdapter())
+        events = [
+            SseEvent(None, json.dumps({
+                "id": "c1", "model": "m",
+                "choices": [{"delta": {"role": "assistant"}}],
+            }), []),
+            SseEvent(None, json.dumps({
+                "id": "c1", "model": "m",
+                "choices": [{"delta": {"content": "Hello world"}}],
+            }), []),
+            SseEvent(None, json.dumps({
+                "id": "c1", "model": "m",
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+            }), []),
+            SseEvent(None, "[DONE]", []),
+        ]
+        chunks = await _collect_stream(converter, events)
+        content_chunks = [
+            c for c in chunks
+            if '"content"' in c and "Hello" in c
+        ]
+        assert len(content_chunks) == 1
+        data = json.loads(
+            content_chunks[0].removeprefix("data: ").strip(),
+        )
+        assert data["choices"][0]["delta"]["content"] == "Hello world"
+
+
+class TestMultimodalContentMapping:
+    """多模态内容映射修复"""
+
+    def test_responses_to_chat_content_list_preserved(self):
+        converter = OpenaiResponsesToOpenaiChatConverter(
+            StandardToolAdapter(),
+        )
+        body = {
+            "model": "p/m",
+            "input": [{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Describe this image"},
+                    {
+                        "type": "input_image",
+                        "image_url": {"url": "https://example.com/img.png"},
+                    },
+                ],
+            }],
+        }
+        result = converter.convert_request(body, "m")
+        user_msg = [
+            m for m in result["messages"]
+            if m["role"] == "user"
+        ][0]
+        assert isinstance(user_msg["content"], list)
+        assert len(user_msg["content"]) == 2
+        assert user_msg["content"][0]["type"] == "text"
+        assert user_msg["content"][1]["type"] == "image_url"
+
+    def test_responses_to_chat_consecutive_user_lists_merged(self):
+        converter = OpenaiResponsesToOpenaiChatConverter(
+            StandardToolAdapter(),
+        )
+        body = {
+            "model": "p/m",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Part 1"}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Part 2"}],
+                },
+            ],
+        }
+        result = converter.convert_request(body, "m")
+        user_msgs = [m for m in result["messages"] if m["role"] == "user"]
+        assert len(user_msgs) == 1
+        content = user_msgs[0]["content"]
+        assert isinstance(content, list)
+        assert len(content) == 2
+        assert content[0]["text"] == "Part 1"
+        assert content[1]["text"] == "Part 2"
+
+    def test_anthropic_to_chat_image_mapped(self):
+        converter = AnthropicMessagesToOpenaiChatConverter(
+            StandardToolAdapter(),
+        )
+        body = {
+            "model": "p/m",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is this?"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "url",
+                            "url": "https://example.com/photo.jpg",
+                        },
+                    },
+                ],
+            }],
+            "max_tokens": 1024,
+        }
+        result = converter.convert_request(body, "m")
+        user_msgs = [
+            m for m in result["messages"]
+            if m["role"] == "user"
+        ]
+        assert len(user_msgs) == 1
+        content = user_msgs[0]["content"]
+        assert isinstance(content, list)
+        assert any(p.get("type") == "image_url" for p in content)
+
+    def test_anthropic_to_chat_base64_image_mapped(self):
+        converter = AnthropicMessagesToOpenaiChatConverter(
+            StandardToolAdapter(),
+        )
+        body = {
+            "model": "p/m",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": "abc123",
+                        },
+                    },
+                ],
+            }],
+            "max_tokens": 1024,
+        }
+        result = converter.convert_request(body, "m")
+        user_msg = [
+            m for m in result["messages"]
+            if m["role"] == "user"
+        ][0]
+        img_part = [
+            p for p in user_msg["content"]
+            if p.get("type") == "image_url"
+        ][0]
+        assert "data:image/jpeg;base64,abc123" in (
+            img_part["image_url"]["url"]
+        )
+
+    def test_anthropic_to_chat_unknown_block_preserved(self):
+        converter = AnthropicMessagesToOpenaiChatConverter(
+            StandardToolAdapter(),
+        )
+        body = {
+            "model": "p/m",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Hi"},
+                    {"type": "custom_block", "data": "xyz"},
+                ],
+            }],
+            "max_tokens": 1024,
+        }
+        result = converter.convert_request(body, "m")
+        user_msg = [
+            m for m in result["messages"]
+            if m["role"] == "user"
+        ][0]
+        assert any(
+            p.get("type") == "custom_block" for p in user_msg["content"]
+        )
+
+
+class TestSystemContentListNormalization:
+    """system content 为 list 时不再崩溃"""
+
+    def test_chat_to_anthropic_system_list(self):
+        converter = OpenaiChatToAnthropicMessagesConverter(
+            AnthropicToolAdapter(),
+        )
+        body = {
+            "model": "p/m",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "Be helpful."},
+                        {"type": "text", "text": "Be concise."},
+                    ],
+                },
+                {"role": "user", "content": "Hi"},
+            ],
+        }
+        result = converter.convert_request(body, "m")
+        assert "Be helpful." in result["system"]
+        assert "Be concise." in result["system"]
+
+    def test_chat_to_responses_system_list(self):
+        converter = OpenaiChatToOpenaiResponsesConverter(
+            StandardToolAdapter(),
+        )
+        body = {
+            "model": "p/m",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "System prompt."},
+                    ],
+                },
+                {"role": "user", "content": "Hi"},
+            ],
+        }
+        result = converter.convert_request(body, "m")
+        assert "System prompt." in result.get("instructions", "")
+
+    def test_chat_tool_adapt_system_list(self):
+        converter = OpenaiChatToolAdaptConverter(MinimaxXmlToolAdapter())
+        body = {
+            "model": "p/m",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "Base system."},
+                    ],
+                },
+                {"role": "user", "content": "Hi"},
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "description": "Search",
+                    "parameters": {"type": "object"},
+                },
+            }],
+        }
+        result = converter.convert_request(body, "m")
+        sys_msg = result["messages"][0]
+        assert sys_msg["role"] == "system"
+        assert "Base system." in sys_msg["content"]
+        assert "search" in sys_msg["content"]

@@ -38,6 +38,11 @@ class ToolAdapter(ABC):
             (cleaned_content, normalized_calls)
         """
 
+    @property
+    def stream_buffer_size(self) -> int:
+        """流式工具调用检测需要的回看缓冲字节数，0 表示无需缓冲"""
+        return 0
+
     @abstractmethod
     def detect_stream_tool_boundary(
         self, text: str,

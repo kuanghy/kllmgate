@@ -36,7 +36,14 @@ def _coerce_param_value(value: str):
         return value
 
 
+_TOOL_CALL_TAG = "<minimax:tool_call>"
+
+
 class MinimaxXmlToolAdapter(ToolAdapter):
+
+    @property
+    def stream_buffer_size(self) -> int:
+        return len(_TOOL_CALL_TAG)
 
     def convert_tool_definitions(
         self, tools: list[dict],

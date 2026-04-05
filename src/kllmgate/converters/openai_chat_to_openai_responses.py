@@ -10,6 +10,7 @@ from ._helpers import (
     make_resp_id,
     make_msg_id,
     now_ts,
+    normalize_text_content,
     responses_usage_to_chat,
     STATUS_TO_FINISH_REASON,
 )
@@ -27,7 +28,9 @@ class OpenaiChatToOpenaiResponsesConverter(Converter):
             role = msg.get("role", "user")
 
             if role == "system":
-                system_parts.append(msg.get("content", ""))
+                system_parts.append(
+                    normalize_text_content(msg.get("content", "")),
+                )
                 continue
 
             if role == "assistant":

@@ -8,7 +8,9 @@ from collections.abc import AsyncIterator
 
 from . import Converter
 from ._helpers import (
-    convert_content_list,
+    convert_content_to_chat_parts,
+    normalize_text_content,
+    merge_chat_content,
     make_resp_id,
     make_msg_id,
     now_ts,
@@ -115,11 +117,13 @@ class OpenaiResponsesToOpenaiChatConverter(Converter):
                 role = "system"
 
             content = item.get("content", "")
-            if isinstance(content, list):
-                content = convert_content_list(content)
-
             if role == "system":
-                system_contents.append(content)
+                system_contents.append(normalize_text_content(content))
+            elif isinstance(content, list):
+                raw_messages.append({
+                    "role": role,
+                    "content": convert_content_to_chat_parts(content),
+                })
             else:
                 raw_messages.append({"role": role, "content": content})
 
@@ -138,7 +142,9 @@ class OpenaiResponsesToOpenaiChatConverter(Converter):
                 and messages[-1]["role"] == msg["role"]
                 and msg["role"] != "assistant"
             ):
-                messages[-1]["content"] += "\n\n" + msg["content"]
+                messages[-1]["content"] = merge_chat_content(
+                    messages[-1]["content"], msg["content"],
+                )
             else:
                 messages.append(msg)
 
@@ -344,17 +350,19 @@ class OpenaiResponsesToOpenaiChatConverter(Converter):
             if tc_detected:
                 continue
 
+            buf_size = self.tool_adapter.stream_buffer_size
             boundary = self.tool_adapter.detect_stream_tool_boundary(
                 full_text,
             )
             if boundary is not None:
                 tc_detected = True
                 safe_end = boundary
-            else:
-                tag_len = len("<minimax:tool_call>")
+            elif buf_size > 0:
                 safe_end = max(
-                    sent_pos, len(full_text) - tag_len,
+                    sent_pos, len(full_text) - buf_size,
                 )
+            else:
+                safe_end = len(full_text)
 
             unsent = full_text[sent_pos:safe_end]
             if unsent:

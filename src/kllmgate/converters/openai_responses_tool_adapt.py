@@ -120,16 +120,19 @@ class OpenaiResponsesToolAdaptConverter(Converter):
             if event.event == "response.output_text.delta":
                 delta = data.get("delta", "")
                 full_text += delta
+                buf_size = self.tool_adapter.stream_buffer_size
                 boundary = self.tool_adapter.detect_stream_tool_boundary(
                     full_text,
                 )
                 if boundary is not None:
                     xml_detected = True
                     safe_end = boundary
-                else:
+                elif buf_size > 0:
                     safe_end = max(
-                        sent_pos, len(full_text) - len("<minimax:tool_call>"),
+                        sent_pos, len(full_text) - buf_size,
                     )
+                else:
+                    safe_end = len(full_text)
                 unsent = full_text[sent_pos:safe_end]
                 if unsent:
                     new_data = {

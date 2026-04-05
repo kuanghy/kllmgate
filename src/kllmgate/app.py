@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from contextlib import asynccontextmanager
 
@@ -9,7 +10,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from .config import load_config
-from .errors import GatewayError, format_error_response
+from .errors import GatewayError, ProtocolError, format_error_response
 from .models import ProtocolFormat
 from .pipeline import PROVIDER_HEADER, process_request
 from .upstream.client import UpstreamClient
@@ -43,7 +44,10 @@ def create_app(config_path: str = "config.toml") -> FastAPI:
     @app.post("/openai/chat/completions")
     async def openai_chat(request: Request):
         try:
-            body = await request.json()
+            try:
+                body = await request.json()
+            except json.JSONDecodeError as e:
+                raise ProtocolError(f"invalid JSON body: {e}") from e
             return await process_request(
                 ProtocolFormat.OPENAI_CHAT,
                 body,
@@ -60,7 +64,10 @@ def create_app(config_path: str = "config.toml") -> FastAPI:
     @app.post("/openai/responses")
     async def openai_responses(request: Request):
         try:
-            body = await request.json()
+            try:
+                body = await request.json()
+            except json.JSONDecodeError as e:
+                raise ProtocolError(f"invalid JSON body: {e}") from e
             return await process_request(
                 ProtocolFormat.OPENAI_RESPONSES,
                 body,
@@ -77,7 +84,10 @@ def create_app(config_path: str = "config.toml") -> FastAPI:
     @app.post("/anthropic/v1/messages")
     async def anthropic_messages(request: Request):
         try:
-            body = await request.json()
+            try:
+                body = await request.json()
+            except json.JSONDecodeError as e:
+                raise ProtocolError(f"invalid JSON body: {e}") from e
             return await process_request(
                 ProtocolFormat.ANTHROPIC_MESSAGES,
                 body,

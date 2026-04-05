@@ -6,6 +6,7 @@ import json
 from collections.abc import AsyncIterator
 
 from . import Converter
+from ._helpers import normalize_text_content
 from ..sse import SseEvent, format_data_only_sse
 
 
@@ -26,12 +27,12 @@ class OpenaiChatToolAdaptConverter(Converter):
                     messages
                     and messages[0].get("role") == "system"
                 ):
+                    existing = normalize_text_content(
+                        messages[0]["content"],
+                    )
                     messages[0] = {
                         **messages[0],
-                        "content": (
-                            messages[0]["content"]
-                            + "\n\n" + prompt_add
-                        ),
+                        "content": existing + "\n\n" + prompt_add,
                     }
                 else:
                     messages.insert(0, {
@@ -115,15 +116,18 @@ class OpenaiChatToolAdaptConverter(Converter):
             delta_text = delta.get("content", "")
             if delta_text:
                 full_text += delta_text
+                buf_size = self.tool_adapter.stream_buffer_size
                 boundary = self.tool_adapter.detect_stream_tool_boundary(
                     full_text,
                 )
                 if boundary is not None:
                     safe_end = boundary
-                else:
+                elif buf_size > 0:
                     safe_end = max(
-                        sent_pos, len(full_text) - len("<minimax:tool_call>"),
+                        sent_pos, len(full_text) - buf_size,
                     )
+                else:
+                    safe_end = len(full_text)
                 unsent = full_text[sent_pos:safe_end]
                 if unsent:
                     yield format_data_only_sse({

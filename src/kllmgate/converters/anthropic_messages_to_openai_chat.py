@@ -57,20 +57,51 @@ class AnthropicMessagesToOpenaiChatConverter(Converter):
                 continue
 
             if role == "user" and isinstance(content, list):
+                tool_results = []
+                user_parts = []
                 for block in content:
-                    if block.get("type") == "tool_result":
-                        messages.append({
+                    block_type = block.get("type", "")
+                    if block_type == "tool_result":
+                        tool_results.append({
                             "role": "tool",
                             "tool_call_id": block.get(
                                 "tool_use_id", "",
                             ),
                             "content": block.get("content", ""),
                         })
-                    elif block.get("type") == "text":
-                        messages.append({
-                            "role": "user",
-                            "content": block.get("text", ""),
+                    elif block_type == "text":
+                        user_parts.append({
+                            "type": "text",
+                            "text": block.get("text", ""),
                         })
+                    elif block_type == "image":
+                        source = block.get("source", {})
+                        if source.get("type") == "url":
+                            user_parts.append({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": source.get("url", ""),
+                                },
+                            })
+                        elif source.get("type") == "base64":
+                            media = source.get("media_type", "image/png")
+                            data = source.get("data", "")
+                            user_parts.append({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{media};base64,{data}",
+                                },
+                            })
+                        else:
+                            user_parts.append(block)
+                    else:
+                        user_parts.append(block)
+                messages.extend(tool_results)
+                if user_parts:
+                    messages.append({
+                        "role": "user",
+                        "content": user_parts,
+                    })
                 continue
 
             messages.append({"role": role, "content": content})

@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 from . import Converter
 from ._helpers import (
     now_ts,
+    normalize_text_content,
     anthropic_usage_to_chat,
     ANTHROPIC_STOP_TO_OPENAI,
 )
@@ -26,7 +27,7 @@ class OpenaiChatToAnthropicMessagesConverter(Converter):
             content = msg.get("content", "")
 
             if role == "system":
-                system_parts.append(content)
+                system_parts.append(normalize_text_content(content))
                 continue
 
             if role == "assistant":

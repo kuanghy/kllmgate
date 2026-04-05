@@ -94,6 +94,7 @@ class AnthropicMessagesToOpenaiResponsesConverter(Converter):
         model_name = ""
         content_index = 0
         full_text = ""
+        usage: dict = {}
 
         async for event in upstream_events:
             if not event.event:
@@ -140,6 +141,12 @@ class AnthropicMessagesToOpenaiResponsesConverter(Converter):
                 })
 
             elif event.event == "response.completed":
+                resp_obj = data.get("response", {})
+                if isinstance(resp_obj.get("usage"), dict):
+                    usage.update(resp_obj["usage"])
+                anthropic_usage = chat_usage_to_anthropic(
+                    responses_usage_to_chat(usage),
+                )
                 yield format_named_sse("content_block_stop", {
                     "type": "content_block_stop",
                     "index": content_index,
@@ -147,7 +154,11 @@ class AnthropicMessagesToOpenaiResponsesConverter(Converter):
                 yield format_named_sse("message_delta", {
                     "type": "message_delta",
                     "delta": {"stop_reason": "end_turn"},
-                    "usage": {"output_tokens": 0},
+                    "usage": {
+                        "output_tokens": anthropic_usage.get(
+                            "output_tokens", 0,
+                        ),
+                    },
                 })
                 yield format_named_sse("message_stop", {
                     "type": "message_stop",
