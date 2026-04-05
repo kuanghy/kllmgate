@@ -6,7 +6,7 @@ import json
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
 from .config import load_config
@@ -100,5 +100,16 @@ def create_app(config_path: str = "config.toml") -> FastAPI:
             return format_error_response(
                 e, ProtocolFormat.ANTHROPIC_MESSAGES,
             )
+
+    @app.api_route(
+        "/{prefix}",
+        methods=["HEAD", "GET"],
+        include_in_schema=False,
+    )
+    async def health_check(prefix: str):
+        """Claude Code 等客户端启动时会对 base URL 发 HEAD 探测"""
+        if prefix not in ("anthropic", "openai"):
+            return Response(status_code=404)
+        return Response(status_code=200)
 
     return app
