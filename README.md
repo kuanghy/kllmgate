@@ -26,7 +26,7 @@ kllmgate/
 │       ├── config.py
 │       ├── pipeline.py
 │       ├── converters/
-│       ├── tools/
+│       ├── toolcall/
 │       └── upstream/
 └── tests/
 ```
@@ -85,15 +85,3 @@ kllmgate --config config.toml
   "model": "openai_official/gpt-4.1"
 }
 ```
-
-## 测试
-
-```bash
-python -m pytest tests -v --tb=short --color=no
-```
-
-当前测试状态：`184 passed`
-
-## 说明
-
-旧单文件实现已移至 `scripts/kllmgate_legacy.py`，仅作为历史参考保留。当前应使用包入口 `python -m kllmgate` 或命令 `kllmgate` 启动。

@@ -4,9 +4,9 @@ import json
 
 import pytest
 
-from kllmgate.tools.standard import StandardToolAdapter
-from kllmgate.tools.minimax_xml import MinimaxXmlToolAdapter
-from kllmgate.tools.anthropic import AnthropicToolAdapter
+from kllmgate.toolcall.standard import StandardToolAdapter
+from kllmgate.toolcall.minimax_xml import MinimaxXmlToolAdapter
+from kllmgate.toolcall.anthropic import AnthropicToolAdapter
 
 
 SAMPLE_TOOLS = [

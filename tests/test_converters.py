@@ -6,9 +6,9 @@ import time
 import pytest
 
 from kllmgate.sse import SseEvent
-from kllmgate.tools.standard import StandardToolAdapter
-from kllmgate.tools.minimax_xml import MinimaxXmlToolAdapter
-from kllmgate.tools.anthropic import AnthropicToolAdapter
+from kllmgate.toolcall.standard import StandardToolAdapter
+from kllmgate.toolcall.minimax_xml import MinimaxXmlToolAdapter
+from kllmgate.toolcall.anthropic import AnthropicToolAdapter
 from kllmgate.converters.passthrough import PassthroughConverter
 from kllmgate.converters.openai_responses_to_openai_chat import (
     OpenaiResponsesToOpenaiChatConverter,

@@ -32,10 +32,10 @@ from .converters.anthropic_messages_to_openai_responses import (
 )
 from .errors import ConfigError
 from .models import ProtocolFormat, ProviderConfig
-from .tools import ToolAdapter
-from .tools.standard import StandardToolAdapter
-from .tools.minimax_xml import MinimaxXmlToolAdapter
-from .tools.anthropic import AnthropicToolAdapter
+from .toolcall import ToolAdapter
+from .toolcall.standard import StandardToolAdapter
+from .toolcall.minimax_xml import MinimaxXmlToolAdapter
+from .toolcall.anthropic import AnthropicToolAdapter
 from .upstream.client import UpstreamClient
 
 PF = ProtocolFormat
