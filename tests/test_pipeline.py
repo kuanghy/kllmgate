@@ -8,6 +8,7 @@ from kllmgate.pipeline import (
     get_tool_adapter,
     get_converter,
     process_request,
+    resolve_provider_and_model,
 )
 from kllmgate.toolcall.standard import StandardToolAdapter
 from kllmgate.toolcall.minimax_xml import MinimaxXmlToolAdapter
@@ -85,11 +86,50 @@ class TestGetConverter:
         assert isinstance(conv, PassthroughConverter)
 
 
+class TestResolveProviderAndModel:
+
+    def test_provider_slash_model(self):
+        p, m = resolve_provider_and_model("scnet/MiniMax-M2.5", None, {})
+        assert (p, m) == ("scnet", "MiniMax-M2.5")
+
+    def test_model_alias(self):
+        aliases = {"MiniMax-M2.5": "scnet/MiniMax-M2.5"}
+        p, m = resolve_provider_and_model("MiniMax-M2.5", None, aliases)
+        assert (p, m) == ("scnet", "MiniMax-M2.5")
+
+    def test_header_provider(self):
+        p, m = resolve_provider_and_model("MiniMax-M2.5", "scnet", {})
+        assert (p, m) == ("scnet", "MiniMax-M2.5")
+
+    def test_slash_takes_priority_over_header(self):
+        p, m = resolve_provider_and_model(
+            "openai/gpt-4.1", "scnet", {},
+        )
+        assert (p, m) == ("openai", "gpt-4.1")
+
+    def test_alias_takes_priority_over_header(self):
+        aliases = {"gpt-4": "openai/gpt-4"}
+        p, m = resolve_provider_and_model("gpt-4", "scnet", aliases)
+        assert (p, m) == ("openai", "gpt-4")
+
+    def test_bare_model_no_header_raises(self):
+        with pytest.raises(ConfigError, match="cannot determine provider"):
+            resolve_provider_and_model("MiniMax-M2.5", None, {})
+
+    def test_empty_model_raises(self):
+        with pytest.raises(ConfigError, match="required"):
+            resolve_provider_and_model("", None, {})
+
+    def test_multi_segment_model(self):
+        p, m = resolve_provider_and_model("org/ns/model-v2", None, {})
+        assert (p, m) == ("org", "ns/model-v2")
+
+
 class TestProcessRequest:
 
     @pytest.mark.asyncio
     async def test_invalid_model_format_raises(self):
-        with pytest.raises(ConfigError, match="provider/model"):
+        with pytest.raises(ConfigError, match="cannot determine provider"):
             await process_request(
                 PF.OPENAI_CHAT,
                 {"model": "no-slash"},

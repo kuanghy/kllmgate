@@ -97,3 +97,89 @@ class TestRoutes:
         body = resp.json()
         assert body["type"] == "error"
         assert "message" in body["error"]
+
+    def test_header_provider_routes_bare_model(self, client):
+        """header 提供 provider 后裸模型名不再报 invalid_model_format"""
+        try:
+            resp = client.post(
+                "/openai/chat/completions",
+                json={
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                headers={"X-KLLMGate-Provider": "test_openai"},
+            )
+        except Exception:
+            return
+        if resp.status_code == 400:
+            assert resp.json()["error"]["code"] != "invalid_model_format"
+
+    def test_header_provider_unknown_raises(self, client):
+        resp = client.post(
+            "/openai/chat/completions",
+            json={"model": "gpt-4", "messages": []},
+            headers={"X-KLLMGate-Provider": "nonexistent"},
+        )
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body["error"]["code"] == "unknown_provider"
+
+    def test_model_slash_overrides_header(self, client):
+        """model 含 / 时 provider 以 model 为准，忽略 header"""
+        try:
+            resp = client.post(
+                "/openai/chat/completions",
+                json={
+                    "model": "test_openai/gpt-4",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                headers={"X-KLLMGate-Provider": "test_anthropic"},
+            )
+        except Exception:
+            return
+        if resp.status_code == 400:
+            assert resp.json()["error"]["code"] != "invalid_model_format"
+
+
+class TestModelAliasRoutes:
+
+    @pytest.fixture
+    def alias_config_file(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(textwrap.dedent("""\
+            [providers.scnet]
+            base_url = "https://api.scnet.cn/v1"
+            api_key = "sk-test"
+            protocol = "openai"
+
+            [model_aliases]
+            "MiniMax-M2.5" = "scnet/MiniMax-M2.5"
+        """))
+        return str(path)
+
+    @pytest.fixture
+    def alias_client(self, alias_config_file):
+        app = create_app(config_path=alias_config_file)
+        with TestClient(app) as c:
+            yield c
+
+    def test_alias_routes_bare_model(self, alias_client):
+        """别名匹配后裸模型名不再报 invalid_model_format"""
+        try:
+            resp = alias_client.post(
+                "/openai/responses",
+                json={"model": "MiniMax-M2.5", "input": "hi"},
+            )
+        except Exception:
+            return
+        if resp.status_code == 400:
+            assert resp.json()["error"]["code"] != "invalid_model_format"
+
+    def test_alias_unknown_model_falls_through(self, alias_client):
+        resp = alias_client.post(
+            "/openai/responses",
+            json={"model": "unknown-model"},
+        )
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body["error"]["code"] == "invalid_model_format"

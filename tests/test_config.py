@@ -29,7 +29,8 @@ class TestLoadConfig:
             protocol = "openai"
             wire_api = "chat"
         """)
-        providers = load_config(path)
+        providers, aliases = load_config(path)
+        assert aliases == {}
         assert len(providers) == 1
         cfg = providers["openai_official"]
         assert cfg.name == "openai_official"
@@ -45,7 +46,7 @@ class TestLoadConfig:
             api_key = "sk-ant-test"
             protocol = "anthropic"
         """)
-        providers = load_config(path)
+        providers, _ = load_config(path)
         cfg = providers["anthropic_official"]
         assert cfg.protocol == "anthropic"
         assert cfg.wire_api == "messages"
@@ -62,7 +63,7 @@ class TestLoadConfig:
             api_key = "sk-2"
             protocol = "anthropic"
         """)
-        providers = load_config(path)
+        providers, _ = load_config(path)
         assert len(providers) == 2
         assert "openai" in providers
         assert "anthropic" in providers
@@ -74,7 +75,7 @@ class TestLoadConfig:
             api_key = "sk-test"
             protocol = "openai"
         """)
-        providers = load_config(path)
+        providers, _ = load_config(path)
         cfg = providers["test"]
         assert cfg.wire_api == "chat"
         assert cfg.tool_style == "standard"
@@ -94,7 +95,7 @@ class TestLoadConfig:
             max_retries = 5
             models = ["model-a", "model-b"]
         """)
-        providers = load_config(path)
+        providers, _ = load_config(path)
         cfg = providers["minimax"]
         assert cfg.tool_style == "minimax_xml"
         assert cfg.timeout_seconds == 60
@@ -108,7 +109,7 @@ class TestLoadConfig:
             api_key = "sk-test"
             protocol = "openai"
         """)
-        providers = load_config(path)
+        providers, _ = load_config(path)
         assert providers["test"].base_url == "https://api.example.com/v1"
 
     def test_env_key_config(self, toml_file, monkeypatch):
@@ -119,7 +120,7 @@ class TestLoadConfig:
             env_key = "MY_API_KEY"
             protocol = "openai"
         """)
-        providers = load_config(path)
+        providers, _ = load_config(path)
         cfg = providers["test"]
         assert cfg.env_key == "MY_API_KEY"
         assert cfg.resolve_api_key() == "sk-from-env"
@@ -234,8 +235,61 @@ class TestLoadConfigValidation:
             protocol = "openai"
             wire_api = "responses"
         """)
-        providers = load_config(path)
+        providers, _ = load_config(path)
         cfg = providers["test"]
         assert cfg.wire_api == "responses"
         from kllmgate.models import ProtocolFormat
         assert cfg.protocol_format == ProtocolFormat.OPENAI_RESPONSES
+
+    def test_model_aliases_parsed(self, toml_file):
+        path = toml_file("""\
+            [providers.scnet]
+            base_url = "https://api.scnet.cn/v1"
+            api_key = "sk-test"
+            protocol = "openai"
+
+            [model_aliases]
+            "MiniMax-M2.5" = "scnet/MiniMax-M2.5"
+            "gpt-4" = "scnet/gpt-4"
+        """)
+        _, aliases = load_config(path)
+        assert aliases == {
+            "MiniMax-M2.5": "scnet/MiniMax-M2.5",
+            "gpt-4": "scnet/gpt-4",
+        }
+
+    def test_model_aliases_empty_by_default(self, toml_file):
+        path = toml_file("""\
+            [providers.test]
+            base_url = "https://api.example.com"
+            api_key = "sk-test"
+            protocol = "openai"
+        """)
+        _, aliases = load_config(path)
+        assert aliases == {}
+
+    def test_model_aliases_invalid_target_format_raises(self, toml_file):
+        path = toml_file("""\
+            [providers.test]
+            base_url = "https://api.example.com"
+            api_key = "sk-test"
+            protocol = "openai"
+
+            [model_aliases]
+            "gpt-4" = "no-slash"
+        """)
+        with pytest.raises(ConfigError, match="provider/model"):
+            load_config(path)
+
+    def test_model_aliases_unknown_provider_raises(self, toml_file):
+        path = toml_file("""\
+            [providers.test]
+            base_url = "https://api.example.com"
+            api_key = "sk-test"
+            protocol = "openai"
+
+            [model_aliases]
+            "gpt-4" = "nonexistent/gpt-4"
+        """)
+        with pytest.raises(ConfigError, match="nonexistent"):
+            load_config(path)

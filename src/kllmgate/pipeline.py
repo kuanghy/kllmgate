@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 
 from fastapi.responses import JSONResponse, StreamingResponse
+
+logger = logging.getLogger(__name__)
 
 from .converters import Converter
 from .converters.passthrough import PassthroughConverter
@@ -101,20 +104,68 @@ async def _replay_prefetched_stream(
         yield event
 
 
+PROVIDER_HEADER = "X-KLLMGate-Provider"
+
+
+def resolve_provider_and_model(
+    model_ref: str,
+    header_provider: str | None,
+    model_aliases: dict[str, str],
+) -> tuple[str, str]:
+    """解析 provider 和上游模型名
+
+    优先级：
+    1. model 含 "/" → 直接拆分
+    2. model 命中 model_aliases → 展开后拆分
+    3. X-KLLMGate-Provider header → header 做 provider，model 原样做上游模型名
+    4. 均不满足 → 抛出 ConfigError
+
+    当 model 含 "/" 且 header 也存在但两者 provider 不一致时，以 model 为准。
+    """
+    if not model_ref:
+        raise ConfigError(
+            "model field is required",
+            code="invalid_model_format",
+        )
+
+    if "/" in model_ref:
+        provider_name, upstream_model = model_ref.split("/", 1)
+        if (
+            header_provider
+            and header_provider != provider_name
+        ):
+            logger.debug(
+                "model provider %r overrides header provider %r",
+                provider_name, header_provider,
+            )
+        return provider_name, upstream_model
+
+    if model_ref in model_aliases:
+        return model_aliases[model_ref].split("/", 1)
+
+    if header_provider:
+        return header_provider, model_ref
+
+    raise ConfigError(
+        f"cannot determine provider for model {model_ref!r}: "
+        f"use provider/model format, configure a model_aliases entry, "
+        f"or set the {PROVIDER_HEADER} header",
+        code="invalid_model_format",
+    )
+
+
 async def process_request(
     inbound_format: ProtocolFormat,
     body: dict,
     providers: dict[str, ProviderConfig],
     upstream_clients: dict[str, UpstreamClient],
+    header_provider: str | None = None,
+    model_aliases: dict[str, str] | None = None,
 ) -> JSONResponse | StreamingResponse:
     model_ref = body.get("model", "")
-    if not model_ref or "/" not in model_ref:
-        raise ConfigError(
-            f"model must be in provider/model format: {model_ref!r}",
-            code="invalid_model_format",
-        )
-
-    provider_name, upstream_model = model_ref.split("/", 1)
+    provider_name, upstream_model = resolve_provider_and_model(
+        model_ref, header_provider, model_aliases or {},
+    )
 
     if provider_name not in providers:
         raise ConfigError(
@@ -135,6 +186,10 @@ async def process_request(
     converter = get_converter(inbound_format, upstream_format, tool_adapter)
 
     upstream_body = converter.convert_request(body, upstream_model)
+    logger.debug(
+        "Upstream request: provider=%s model=%s converter=%s",
+        provider_name, upstream_model, type(converter).__name__,
+    )
 
     client = upstream_clients.get(provider_name)
     if client is None:

@@ -12,8 +12,15 @@ _VALID_PROTOCOLS = {"openai", "anthropic"}
 _VALID_WIRE_APIS = {"chat", "responses", "messages"}
 
 
-def load_config(path: str) -> dict[str, ProviderConfig]:
-    """加载并校验 TOML 配置文件，返回 provider 名称到配置的映射"""
+def load_config(
+    path: str,
+) -> tuple[dict[str, ProviderConfig], dict[str, str]]:
+    """加载并校验 TOML 配置文件
+
+    Returns:
+        (providers, model_aliases) 二元组；providers 为名称到配置的映射，
+        model_aliases 将裸模型名映射到 provider/model 全限定名
+    """
     config_path = Path(path)
     if not config_path.exists():
         raise ConfigError(
@@ -41,7 +48,8 @@ def load_config(path: str) -> dict[str, ProviderConfig]:
     for name, section in providers_raw.items():
         providers[name] = _parse_provider(name, section)
 
-    return providers
+    model_aliases = _parse_model_aliases(raw, providers)
+    return providers, model_aliases
 
 
 def _parse_provider(name: str, section: dict) -> ProviderConfig:
@@ -98,3 +106,28 @@ def _parse_provider(name: str, section: dict) -> ProviderConfig:
     # 启动阶段提前验证 API key，避免服务在不可用配置下成功启动
     provider.resolve_api_key()
     return provider
+
+
+def _parse_model_aliases(
+    raw: dict,
+    providers: dict[str, ProviderConfig],
+) -> dict[str, str]:
+    """解析 [model_aliases] 段并校验目标格式"""
+    aliases_raw = raw.get("model_aliases", {})
+    aliases: dict[str, str] = {}
+    for alias, target in aliases_raw.items():
+        if "/" not in target:
+            raise ConfigError(
+                f"model_aliases: target for {alias!r} must be in "
+                f"provider/model format, got {target!r}",
+                code="invalid_alias_target",
+            )
+        provider_name = target.split("/", 1)[0]
+        if provider_name not in providers:
+            raise ConfigError(
+                f"model_aliases: target provider {provider_name!r} "
+                f"for alias {alias!r} not found in providers",
+                code="alias_unknown_provider",
+            )
+        aliases[alias] = target
+    return aliases

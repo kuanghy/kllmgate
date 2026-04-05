@@ -78,10 +78,41 @@ kllmgate --config config.toml
 - `POST /openai/responses`
 - `POST /anthropic/v1/messages`
 
-客户端请求中的 `model` 必须使用 `provider/model` 形式，例如：
+客户端指定模型提供商有三种方式（按优先级从高到低）：
+
+**方式一：`provider/model` 格式（推荐）**
 
 ```json
 {
   "model": "openai_official/gpt-4.1"
 }
 ```
+
+**方式二：配置模型别名**
+
+在 `config.toml` 中添加：
+
+```toml
+[model_aliases]
+"MiniMax-M2.5" = "minimax_proxy/MiniMax-M2.5"
+```
+
+客户端直接使用裸模型名：
+
+```json
+{
+  "model": "MiniMax-M2.5"
+}
+```
+
+**方式三：`X-KLLMGate-Provider` 请求头**
+
+适用于不支持 `provider/model` 格式的客户端（如 Codex）：
+
+```bash
+curl -H "X-KLLMGate-Provider: minimax_proxy" \
+     -d '{"model": "MiniMax-M2.5", ...}' \
+     http://localhost:8500/openai/chat/completions
+```
+
+该 header 仅在网关层消费，不会透传到上游。
