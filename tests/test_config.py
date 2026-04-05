@@ -205,6 +205,27 @@ class TestLoadConfigValidation:
         with pytest.raises(ConfigError, match="not found"):
             load_config("/nonexistent/config.toml")
 
+    def test_env_key_missing_in_environment_raises(self, toml_file):
+        path = toml_file("""\
+            [providers.test]
+            base_url = "https://api.example.com"
+            env_key = "MISSING_ENV_12345"
+            protocol = "openai"
+        """)
+        with pytest.raises(ConfigError, match="API key"):
+            load_config(path)
+
+    def test_env_key_empty_in_environment_raises(self, toml_file, monkeypatch):
+        monkeypatch.setenv("EMPTY_ENV_KEY", "")
+        path = toml_file("""\
+            [providers.test]
+            base_url = "https://api.example.com"
+            env_key = "EMPTY_ENV_KEY"
+            protocol = "openai"
+        """)
+        with pytest.raises(ConfigError, match="API key"):
+            load_config(path)
+
     def test_openai_responses_wire_api(self, toml_file):
         path = toml_file("""\
             [providers.test]

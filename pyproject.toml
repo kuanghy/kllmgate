@@ -14,6 +14,13 @@ dependencies = [
     "httpx>=0.28",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-httpx",
+]
+
 [project.scripts]
 kllmgate = "kllmgate.__main__:main"
 

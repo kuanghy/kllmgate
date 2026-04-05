@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .converters import Converter
@@ -90,6 +92,15 @@ def get_converter(
     return converter_cls(tool_adapter)
 
 
+async def _replay_prefetched_stream(
+    first_event,
+    upstream_events: AsyncIterator,
+) -> AsyncIterator:
+    yield first_event
+    async for event in upstream_events:
+        yield event
+
+
 async def process_request(
     inbound_format: ProtocolFormat,
     body: dict,
@@ -136,7 +147,19 @@ async def process_request(
 
     if stream:
         upstream_events = client.send_stream(upstream_body)
-        event_stream = converter.convert_stream(upstream_events)
+        try:
+            first_event = await anext(upstream_events)
+        except StopAsyncIteration:
+            async def _empty_events():
+                return
+                yield
+
+            source_events = _empty_events()
+        else:
+            source_events = _replay_prefetched_stream(
+                first_event, upstream_events,
+            )
+        event_stream = converter.convert_stream(source_events)
         return StreamingResponse(
             event_stream,
             media_type="text/event-stream",

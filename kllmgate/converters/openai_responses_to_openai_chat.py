@@ -228,6 +228,7 @@ class OpenaiResponsesToOpenaiChatConverter(Converter):
         full_text = ""
         sent_pos = 0
         tc_detected = False
+        streamed_tool_calls: dict[int, dict] = {}
         seq = 0
         usage = {}
 
@@ -293,6 +294,21 @@ class OpenaiResponsesToOpenaiChatConverter(Converter):
             if not choices:
                 continue
             delta = choices[0].get("delta", {})
+            for tc_delta in delta.get("tool_calls", []):
+                tc_index = tc_delta.get("index", 0)
+                existing = streamed_tool_calls.setdefault(tc_index, {
+                    "id": "",
+                    "name": "",
+                    "arguments": "",
+                })
+                if tc_delta.get("id"):
+                    existing["id"] = tc_delta["id"]
+                function = tc_delta.get("function", {})
+                if function.get("name"):
+                    existing["name"] = function["name"]
+                if function.get("arguments"):
+                    existing["arguments"] += function["arguments"]
+
             delta_text = delta.get("content", "")
             if not delta_text:
                 continue
@@ -327,6 +343,15 @@ class OpenaiResponsesToOpenaiChatConverter(Converter):
         clean_text, tool_calls = (
             self.tool_adapter.extract_tool_calls({"content": full_text})
         )
+        if streamed_tool_calls:
+            tool_calls.extend(
+                {
+                    "id": item["id"] or f"call_{index}",
+                    "name": item["name"],
+                    "arguments": item["arguments"],
+                }
+                for index, item in sorted(streamed_tool_calls.items())
+            )
 
         remaining = clean_text[sent_pos:]
         if remaining:

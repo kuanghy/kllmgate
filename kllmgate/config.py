@@ -83,7 +83,7 @@ def _parse_provider(name: str, section: dict) -> ProviderConfig:
 
     base_url = section["base_url"].rstrip("/")
 
-    return ProviderConfig(
+    provider = ProviderConfig(
         name=name,
         base_url=base_url,
         api_key=api_key,
@@ -95,3 +95,6 @@ def _parse_provider(name: str, section: dict) -> ProviderConfig:
         max_retries=section.get("max_retries", 2),
         models=section.get("models"),
     )
+    # 启动阶段提前验证 API key，避免服务在不可用配置下成功启动
+    provider.resolve_api_key()
+    return provider

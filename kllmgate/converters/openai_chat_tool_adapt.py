@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 
 from . import Converter
-from .openai_responses_to_openai_chat import (
-    OpenaiResponsesToOpenaiChatConverter,
-)
-from ..sse import SseEvent, format_sse
+from ..sse import SseEvent, format_data_only_sse
 
 
 class OpenaiChatToolAdaptConverter(Converter):
@@ -78,5 +76,107 @@ class OpenaiChatToolAdaptConverter(Converter):
         self,
         upstream_events: AsyncIterator[SseEvent],
     ) -> AsyncIterator[str]:
+        resp_id = ""
+        model_name = ""
+        full_text = ""
+        sent_pos = 0
+        sent_role = False
+
         async for event in upstream_events:
-            yield format_sse(event.data, event.event)
+            if event.data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(event.data)
+            except json.JSONDecodeError:
+                continue
+
+            resp_id = chunk.get("id", resp_id)
+            model_name = chunk.get("model", model_name)
+            choices = chunk.get("choices", [])
+            if not choices:
+                continue
+
+            choice = choices[0]
+            delta = choice.get("delta", {})
+            finish_reason = choice.get("finish_reason")
+
+            if delta.get("role") == "assistant" and not sent_role:
+                sent_role = True
+                yield format_data_only_sse({
+                    "id": resp_id,
+                    "object": "chat.completion.chunk",
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant"},
+                    }],
+                })
+
+            delta_text = delta.get("content", "")
+            if delta_text:
+                full_text += delta_text
+                boundary = self.tool_adapter.detect_stream_tool_boundary(
+                    full_text,
+                )
+                if boundary is not None:
+                    safe_end = boundary
+                else:
+                    safe_end = max(
+                        sent_pos, len(full_text) - len("<minimax:tool_call>"),
+                    )
+                unsent = full_text[sent_pos:safe_end]
+                if unsent:
+                    yield format_data_only_sse({
+                        "id": resp_id,
+                        "object": "chat.completion.chunk",
+                        "model": model_name,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": unsent},
+                        }],
+                    })
+                    sent_pos = safe_end
+
+            if finish_reason:
+                clean_text, tool_calls = self.tool_adapter.extract_tool_calls(
+                    {"content": full_text},
+                )
+                remaining = clean_text[sent_pos:]
+                if remaining:
+                    yield format_data_only_sse({
+                        "id": resp_id,
+                        "object": "chat.completion.chunk",
+                        "model": model_name,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": remaining},
+                        }],
+                    })
+                final_delta: dict = {}
+                mapped_finish_reason = finish_reason
+                if tool_calls:
+                    final_delta["tool_calls"] = [{
+                        "index": index,
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": tc["arguments"],
+                        },
+                    } for index, tc in enumerate(tool_calls)]
+                    mapped_finish_reason = "tool_calls"
+
+                yield format_data_only_sse({
+                    "id": resp_id,
+                    "object": "chat.completion.chunk",
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": final_delta,
+                        "finish_reason": mapped_finish_reason,
+                    }],
+                })
+                yield "data: [DONE]\n\n"
+                return
+
+        yield "data: [DONE]\n\n"

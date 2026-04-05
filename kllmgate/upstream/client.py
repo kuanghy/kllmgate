@@ -106,29 +106,75 @@ class UpstreamClient:
     ) -> AsyncIterator[SseEvent]:
         """发送流式请求，yield 已完成分帧的 SSE 事件"""
         headers = self._build_headers()
+        last_error: Exception | None = None
 
-        resp = await self._client.send(
-            self._client.build_request(
-                "POST", self._endpoint, json=body, headers=headers,
-            ),
-            stream=True,
-        )
-
-        try:
-            if resp.status_code >= 400:
-                body_text = (await resp.aread()).decode(
-                    errors="replace",
+        for attempt in range(self.config.max_retries + 1):
+            resp: httpx.Response | None = None
+            try:
+                resp = await self._client.send(
+                    self._client.build_request(
+                        "POST", self._endpoint, json=body, headers=headers,
+                    ),
+                    stream=True,
                 )
-                raise UpstreamHTTPError(resp.status_code, body_text)
 
-            async def _line_iter() -> AsyncIterator[str]:
-                async for line in resp.aiter_lines():
-                    yield line
+                if resp.status_code in _RETRYABLE_STATUS_CODES:
+                    body_text = (await resp.aread()).decode(errors="replace")
+                    if attempt < self.config.max_retries:
+                        wait = self._backoff(attempt)
+                        logger.warning(
+                            "Retryable stream HTTP %d (attempt %d/%d), "
+                            "retrying in %.1fs",
+                            resp.status_code,
+                            attempt + 1,
+                            self.config.max_retries + 1,
+                            wait,
+                        )
+                        await resp.aclose()
+                        await asyncio.sleep(wait)
+                        continue
+                    raise UpstreamHTTPError(resp.status_code, body_text)
 
-            async for event in parse_sse_events(_line_iter()):
-                yield event
-        finally:
-            await resp.aclose()
+                if resp.status_code >= 400:
+                    body_text = (await resp.aread()).decode(
+                        errors="replace",
+                    )
+                    raise UpstreamHTTPError(resp.status_code, body_text)
+
+                async def _line_iter() -> AsyncIterator[str]:
+                    async for line in resp.aiter_lines():
+                        yield line
+
+                async for event in parse_sse_events(_line_iter()):
+                    yield event
+                return
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                last_error = e
+                if attempt < self.config.max_retries:
+                    wait = self._backoff(attempt)
+                    logger.warning(
+                        "Stream connect error (attempt %d/%d), "
+                        "retrying in %.1fs: %s",
+                        attempt + 1,
+                        self.config.max_retries + 1,
+                        wait,
+                        e,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                raise UpstreamError(
+                    f"stream connect failed after "
+                    f"{self.config.max_retries + 1} attempts: {e}",
+                    code="upstream_connect_error",
+                ) from e
+            finally:
+                if resp is not None:
+                    await resp.aclose()
+
+        raise UpstreamError(
+            f"stream exhausted retries: {last_error}",
+            code="upstream_connect_error",
+        )
 
     async def close(self):
         await self._client.aclose()

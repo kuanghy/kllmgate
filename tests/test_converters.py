@@ -325,6 +325,53 @@ class TestOpenaiResponsesToOpenaiChatStream:
         assert "response.output_text.delta" in full
         assert "response.completed" in full
 
+    @pytest.mark.asyncio
+    async def test_standard_tool_calls_stream(self):
+        events = [
+            SseEvent(None, json.dumps({
+                "id": "chatcmpl-1",
+                "model": "gpt-4.1",
+                "choices": [{"delta": {"role": "assistant"}}],
+            }), []),
+            SseEvent(None, json.dumps({
+                "id": "chatcmpl-1",
+                "model": "gpt-4.1",
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "get_weather"},
+                        }],
+                    },
+                }],
+            }), []),
+            SseEvent(None, json.dumps({
+                "id": "chatcmpl-1",
+                "model": "gpt-4.1",
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": {"arguments": '{"city":"Beijing"}'},
+                        }],
+                    },
+                }],
+            }), []),
+            SseEvent(None, json.dumps({
+                "id": "chatcmpl-1",
+                "model": "gpt-4.1",
+                "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+            }), []),
+            SseEvent(None, "[DONE]", []),
+        ]
+        chunks = await _collect_stream(self.converter, events)
+        full = "".join(chunks)
+        assert "response.function_call_arguments.delta" in full
+        assert "get_weather" in full
+
 
 # ──────── OpenaiChatToOpenaiResponses ────────
 
@@ -908,6 +955,47 @@ class TestOpenaiChatToolAdaptConverter:
         assert result["model"] == "m"
         assert len(result["messages"]) == 1
 
+    @pytest.mark.asyncio
+    async def test_stream_normalizes_minimax_tool_call(self):
+        events = [
+            SseEvent(None, json.dumps({
+                "id": "chatcmpl-1",
+                "model": "m",
+                "choices": [{"delta": {"role": "assistant"}}],
+            }), []),
+            SseEvent(None, json.dumps({
+                "id": "chatcmpl-1",
+                "model": "m",
+                "choices": [{
+                    "delta": {
+                        "content": (
+                            '<minimax:tool_call><invoke name="search">'
+                            '<parameter name="q">python</parameter>'
+                        ),
+                    },
+                }],
+            }), []),
+            SseEvent(None, json.dumps({
+                "id": "chatcmpl-1",
+                "model": "m",
+                "choices": [{
+                    "delta": {
+                        "content": '</invoke></minimax:tool_call>',
+                    },
+                }],
+            }), []),
+            SseEvent(None, json.dumps({
+                "id": "chatcmpl-1",
+                "model": "m",
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+            }), []),
+            SseEvent(None, "[DONE]", []),
+        ]
+        chunks = await _collect_stream(self.converter, events)
+        full = "".join(chunks)
+        assert '"tool_calls"' in full
+        assert "<minimax:tool_call>" not in full
+
 
 class TestOpenaiResponsesToolAdaptConverter:
 
@@ -931,3 +1019,123 @@ class TestOpenaiResponsesToolAdaptConverter:
         }
         result = self.converter.convert_request(body, "m")
         assert "tools" not in result
+
+    def test_response_normalizes_minimax_tool_call(self):
+        response = {
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 1700000000,
+            "status": "completed",
+            "model": "m",
+            "output": [{
+                "type": "message",
+                "id": "msg_1",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": (
+                        'before <minimax:tool_call><invoke name="search">'
+                        '<parameter name="q">python</parameter>'
+                        '</invoke></minimax:tool_call>'
+                    ),
+                }],
+            }],
+            "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+        }
+        result = self.converter.convert_response(response)
+        function_calls = [
+            item for item in result["output"]
+            if item["type"] == "function_call"
+        ]
+        assert len(function_calls) == 1
+        assert function_calls[0]["name"] == "search"
+
+    @pytest.mark.asyncio
+    async def test_stream_normalizes_minimax_tool_call(self):
+        events = [
+            SseEvent("response.created", json.dumps({
+                "type": "response.created",
+                "response": {
+                    "id": "resp_1",
+                    "object": "response",
+                    "created_at": 1700000000,
+                    "status": "in_progress",
+                    "model": "m",
+                    "output": [],
+                },
+                "sequence_number": 0,
+            }), []),
+            SseEvent("response.in_progress", json.dumps({
+                "type": "response.in_progress",
+                "response": {
+                    "id": "resp_1",
+                    "object": "response",
+                    "created_at": 1700000000,
+                    "status": "in_progress",
+                    "model": "m",
+                    "output": [],
+                },
+                "sequence_number": 1,
+            }), []),
+            SseEvent("response.output_item.added", json.dumps({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "message",
+                    "id": "msg_1",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": [],
+                },
+                "sequence_number": 2,
+            }), []),
+            SseEvent("response.content_part.added", json.dumps({
+                "type": "response.content_part.added",
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": ""},
+                "sequence_number": 3,
+            }), []),
+            SseEvent("response.output_text.delta", json.dumps({
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": (
+                    '<minimax:tool_call><invoke name="search">'
+                    '<parameter name="q">python</parameter>'
+                ),
+                "sequence_number": 4,
+            }), []),
+            SseEvent("response.output_text.delta", json.dumps({
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": '</invoke></minimax:tool_call>',
+                "sequence_number": 5,
+            }), []),
+            SseEvent("response.completed", json.dumps({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "object": "response",
+                    "created_at": 1700000000,
+                    "status": "completed",
+                    "model": "m",
+                    "output": [],
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 2,
+                        "total_tokens": 3,
+                    },
+                },
+                "sequence_number": 6,
+            }), []),
+        ]
+        chunks = await _collect_stream(self.converter, events)
+        full = "".join(chunks)
+        assert "response.function_call_arguments.delta" in full
+        assert "search" in full
+        assert "<minimax:tool_call>" not in full

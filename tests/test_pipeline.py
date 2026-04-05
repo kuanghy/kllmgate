@@ -188,3 +188,27 @@ class TestProcessRequest:
         )
         from starlette.responses import StreamingResponse
         assert isinstance(resp, StreamingResponse)
+
+    @pytest.mark.asyncio
+    async def test_stream_preflight_error_raises_before_response(self):
+        from kllmgate.errors import UpstreamHTTPError
+
+        providers = {"test": _cfg()}
+
+        async def _failing_stream(body):
+            raise UpstreamHTTPError(401, "Unauthorized")
+            yield
+
+        class _Client:
+            def send_stream(self, body):
+                return _failing_stream(body)
+
+        with pytest.raises(UpstreamHTTPError):
+            await process_request(
+                PF.OPENAI_CHAT,
+                {"model": "test/gpt-4", "stream": True, "messages": [
+                    {"role": "user", "content": "hello"},
+                ]},
+                providers,
+                {"test": _Client()},
+            )

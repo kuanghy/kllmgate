@@ -161,3 +161,26 @@ class TestUpstreamClientStream:
             async for _ in client.send_stream({"model": "test"}):
                 pass
         await client.close()
+
+    @pytest.mark.asyncio
+    async def test_send_stream_retries_retryable_status(self, httpx_mock):
+        cfg = _make_config(max_retries=1)
+        client = UpstreamClient(cfg)
+
+        sse_body = (
+            'data: {"choices": [{"delta": {"content": "hi"}}]}\n\n'
+            "data: [DONE]\n\n"
+        )
+        httpx_mock.add_response(status_code=503, text="unavailable")
+        httpx_mock.add_response(
+            text=sse_body,
+            headers={"content-type": "text/event-stream"},
+        )
+
+        events = []
+        async for ev in client.send_stream({"model": "test", "stream": True}):
+            events.append(ev)
+
+        assert len(events) == 2
+        assert events[-1].data == "[DONE]"
+        await client.close()
