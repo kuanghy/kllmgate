@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import time
+import uuid
 from collections.abc import AsyncIterator
 
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -33,8 +36,11 @@ from .converters.openai_responses_to_anthropic_messages import (
 from .converters.anthropic_messages_to_openai_responses import (
     AnthropicMessagesToOpenaiResponsesConverter,
 )
-from .errors import ConfigError
+from .errors import (
+    ConfigError, ConversionError, GatewayError, UpstreamError,
+)
 from .models import ProtocolFormat, ProviderConfig
+from .sse import SseEvent, format_data_only_sse, format_named_sse
 from .toolcall import ToolAdapter
 from .toolcall.standard import StandardToolAdapter
 from .toolcall.minimax_xml import MinimaxXmlToolAdapter
@@ -154,6 +160,151 @@ def resolve_provider_and_model(
     )
 
 
+def _normalize_usage(usage: dict) -> dict:
+    """将不同协议的 usage 格式统一为 input/output/total tokens"""
+    if not usage:
+        return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    input_t = usage.get("input_tokens", usage.get("prompt_tokens", 0))
+    output_t = usage.get(
+        "output_tokens", usage.get("completion_tokens", 0),
+    )
+    total_t = usage.get("total_tokens", 0) or (input_t + output_t)
+    return {
+        "input_tokens": input_t,
+        "output_tokens": output_t,
+        "total_tokens": total_t,
+    }
+
+
+def _log_request(
+    request_id: str,
+    inbound_format: ProtocolFormat,
+    provider: str,
+    model: str,
+    stream: bool,
+    start_time: float,
+    usage: dict,
+    status: str = "ok",
+    error_type: str | None = None,
+) -> None:
+    """记录结构化请求完成日志"""
+    duration_ms = int((time.monotonic() - start_time) * 1000)
+    normalized = _normalize_usage(usage)
+    parts = [
+        f"request_id={request_id}",
+        f"protocol={inbound_format.value}",
+        f"provider={provider}",
+        f"model={model}",
+        f"stream={stream}",
+        f"duration_ms={duration_ms}",
+        f"input_tokens={normalized['input_tokens']}",
+        f"output_tokens={normalized['output_tokens']}",
+        f"total_tokens={normalized['total_tokens']}",
+        f"status={status}",
+    ]
+    if error_type:
+        parts.append(f"error_type={error_type}")
+    logger.info("Request completed: %s", " ".join(parts))
+
+
+async def _track_usage(
+    upstream_events: AsyncIterator[SseEvent],
+    usage: dict,
+) -> AsyncIterator[SseEvent]:
+    """包装上游 SSE 事件流，从中提取 token 用量"""
+    async for event in upstream_events:
+        if event.data and event.data != "[DONE]":
+            try:
+                data = json.loads(event.data)
+                # OpenAI Chat/Responses: 顶层 usage 字段
+                if isinstance(data.get("usage"), dict):
+                    usage.update(data["usage"])
+                # OpenAI Responses: response.completed 中的 usage
+                resp = data.get("response")
+                if isinstance(resp, dict) and isinstance(
+                    resp.get("usage"), dict,
+                ):
+                    usage.update(resp["usage"])
+                # Anthropic: message_start 中的 message.usage
+                msg = data.get("message")
+                if isinstance(msg, dict) and isinstance(
+                    msg.get("usage"), dict,
+                ):
+                    usage.update(msg["usage"])
+            except (json.JSONDecodeError, ValueError):
+                pass
+        yield event
+
+
+def _make_stream_error_events(
+    inbound_format: ProtocolFormat,
+    error_msg: str,
+) -> list[str]:
+    """生成协议对应的流式错误 SSE 事件"""
+    if inbound_format == PF.OPENAI_RESPONSES:
+        return [format_named_sse("response.completed", {
+            "type": "response.completed",
+            "response": {
+                "id": f"resp_{uuid.uuid4().hex[:24]}",
+                "object": "response",
+                "created_at": int(time.time()),
+                "status": "incomplete",
+                "output": [],
+                "error": {
+                    "type": "server_error",
+                    "code": "stream_interrupted",
+                    "message": error_msg,
+                },
+            },
+        })]
+    if inbound_format == PF.OPENAI_CHAT:
+        return [
+            format_data_only_sse({
+                "choices": [{"delta": {}, "finish_reason": None}],
+            }),
+            "data: [DONE]\n\n",
+        ]
+    if inbound_format == PF.ANTHROPIC_MESSAGES:
+        return [format_named_sse("error", {
+            "type": "error",
+            "error": {
+                "type": "server_error",
+                "message": error_msg,
+            },
+        })]
+    return []
+
+
+async def _logged_stream(
+    converter_stream: AsyncIterator[str],
+    request_id: str,
+    inbound_format: ProtocolFormat,
+    provider: str,
+    model: str,
+    stream_usage: dict,
+    start_time: float,
+) -> AsyncIterator[str]:
+    """包装 converter 输出流，提供错误处理与请求日志"""
+    status = "ok"
+    error_type_val: str | None = None
+    try:
+        async for chunk in converter_stream:
+            yield chunk
+    except Exception as e:
+        status = "error"
+        error_type_val = getattr(e, "error_type", "server_error")
+        logger.error("Stream error: %s", e, exc_info=True)
+        for event_text in _make_stream_error_events(
+            inbound_format, str(e),
+        ):
+            yield event_text
+    finally:
+        _log_request(
+            request_id, inbound_format, provider, model,
+            True, start_time, stream_usage, status, error_type_val,
+        )
+
+
 async def process_request(
     inbound_format: ProtocolFormat,
     body: dict,
@@ -162,67 +313,110 @@ async def process_request(
     header_provider: str | None = None,
     model_aliases: dict[str, str] | None = None,
 ) -> JSONResponse | StreamingResponse:
-    model_ref = body.get("model", "")
-    provider_name, upstream_model = resolve_provider_and_model(
-        model_ref, header_provider, model_aliases or {},
-    )
+    request_id = uuid.uuid4().hex
+    start_time = time.monotonic()
+    provider_name = ""
+    upstream_model = ""
+    is_stream = body.get("stream", False)
 
-    if provider_name not in providers:
-        raise ConfigError(
-            f"unknown provider: {provider_name!r}",
-            code="unknown_provider",
-        )
-    provider = providers[provider_name]
-
-    if provider.models and upstream_model not in provider.models:
-        raise ConfigError(
-            f"model {upstream_model!r} not supported by "
-            f"provider {provider_name!r}",
-            code="model_not_supported",
+    try:
+        model_ref = body.get("model", "")
+        provider_name, upstream_model = resolve_provider_and_model(
+            model_ref, header_provider, model_aliases or {},
         )
 
-    upstream_format = provider.protocol_format
-    tool_adapter = get_tool_adapter(provider)
-    converter = get_converter(inbound_format, upstream_format, tool_adapter)
-
-    upstream_body = converter.convert_request(body, upstream_model)
-    logger.debug(
-        "Upstream request: provider=%s model=%s converter=%s",
-        provider_name, upstream_model, type(converter).__name__,
-    )
-
-    client = upstream_clients.get(provider_name)
-    if client is None:
-        raise ConfigError(
-            f"upstream client not initialized for {provider_name!r}",
-            code="client_not_found",
-        )
-
-    stream = body.get("stream", False)
-
-    if stream:
-        upstream_events = client.send_stream(upstream_body)
-        try:
-            first_event = await anext(upstream_events)
-        except StopAsyncIteration:
-            async def _empty_events():
-                return
-                yield
-
-            source_events = _empty_events()
-        else:
-            source_events = _replay_prefetched_stream(
-                first_event, upstream_events,
+        if provider_name not in providers:
+            raise ConfigError(
+                f"unknown provider: {provider_name!r}",
+                code="unknown_provider",
             )
-        event_stream = converter.convert_stream(source_events)
-        return StreamingResponse(
-            event_stream,
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            },
+        provider = providers[provider_name]
+
+        if provider.models and upstream_model not in provider.models:
+            raise ConfigError(
+                f"model {upstream_model!r} not supported by "
+                f"provider {provider_name!r}",
+                code="model_not_supported",
+            )
+
+        upstream_format = provider.protocol_format
+        tool_adapter = get_tool_adapter(provider)
+        converter = get_converter(
+            inbound_format, upstream_format, tool_adapter,
         )
 
-    upstream_response = await client.send(upstream_body)
-    return JSONResponse(converter.convert_response(upstream_response))
+        upstream_body = converter.convert_request(body, upstream_model)
+        logger.debug(
+            "Upstream request: request_id=%s provider=%s model=%s "
+            "converter=%s",
+            request_id, provider_name, upstream_model,
+            type(converter).__name__,
+        )
+
+        client = upstream_clients.get(provider_name)
+        if client is None:
+            raise ConfigError(
+                f"upstream client not initialized for "
+                f"{provider_name!r}",
+                code="client_not_found",
+            )
+
+        if is_stream:
+            stream_usage: dict = {}
+            upstream_events = client.send_stream(upstream_body)
+            try:
+                first_event = await anext(upstream_events)
+            except StopAsyncIteration:
+                async def _empty_events():
+                    return
+                    yield
+
+                source_events = _empty_events()
+            else:
+                source_events = _replay_prefetched_stream(
+                    first_event, upstream_events,
+                )
+
+            tracked = _track_usage(source_events, stream_usage)
+            event_stream = converter.convert_stream(tracked)
+            return StreamingResponse(
+                _logged_stream(
+                    event_stream, request_id, inbound_format,
+                    provider_name, upstream_model,
+                    stream_usage, start_time,
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        upstream_response = await client.send(upstream_body)
+        converted = converter.convert_response(upstream_response)
+        _log_request(
+            request_id, inbound_format, provider_name,
+            upstream_model, False, start_time,
+            upstream_response.get("usage", {}),
+        )
+        return JSONResponse(converted)
+
+    except GatewayError as e:
+        _log_request(
+            request_id, inbound_format, provider_name,
+            upstream_model, is_stream, start_time,
+            {}, "error", e.error_type,
+        )
+        if isinstance(e, (UpstreamError, ConversionError)):
+            logger.error(
+                "%s: %s", type(e).__name__, e.message,
+            )
+        raise
+    except Exception as e:
+        _log_request(
+            request_id, inbound_format, provider_name,
+            upstream_model, is_stream, start_time,
+            {}, "error", "server_error",
+        )
+        logger.error("Unexpected error: %s", e, exc_info=True)
+        raise
