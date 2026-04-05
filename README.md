@@ -19,14 +19,15 @@
 
 ```text
 kllmgate/
-├── kllmgate/
-│   ├── __main__.py
-│   ├── app.py
-│   ├── config.py
-│   ├── pipeline.py
-│   ├── converters/
-│   ├── tools/
-│   └── upstream/
+├── src/
+│   └── kllmgate/
+│       ├── __main__.py
+│       ├── app.py
+│       ├── config.py
+│       ├── pipeline.py
+│       ├── converters/
+│       ├── tools/
+│       └── upstream/
 └── tests/
 ```
 
