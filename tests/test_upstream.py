@@ -67,6 +67,52 @@ class TestUpstreamClientHeaders:
         assert "Authorization" not in headers
 
 
+class TestUpstreamClientExtraHeaders:
+
+    def test_anthropic_extra_headers_merged(self):
+        cfg = _make_config(
+            protocol="anthropic", wire_api="messages",
+            base_url="https://api.anthropic.com",
+        )
+        client = UpstreamClient(cfg)
+        headers = client._build_headers(
+            extra_headers={"anthropic-beta": "output-128k-2025-02-19"},
+        )
+        assert headers["anthropic-beta"] == "output-128k-2025-02-19"
+        assert headers["x-api-key"] == "sk-test"
+        assert headers["anthropic-version"] == "2023-06-01"
+
+    def test_anthropic_extra_headers_override_version(self):
+        cfg = _make_config(
+            protocol="anthropic", wire_api="messages",
+            base_url="https://api.anthropic.com",
+        )
+        client = UpstreamClient(cfg)
+        headers = client._build_headers(
+            extra_headers={"anthropic-version": "2024-10-22"},
+        )
+        assert headers["anthropic-version"] == "2024-10-22"
+
+    def test_openai_ignores_extra_headers(self):
+        cfg = _make_config(protocol="openai")
+        client = UpstreamClient(cfg)
+        headers = client._build_headers(
+            extra_headers={"anthropic-beta": "some-beta"},
+        )
+        assert "anthropic-beta" not in headers
+        assert headers["Authorization"] == "Bearer sk-test"
+
+    def test_anthropic_none_extra_headers(self):
+        cfg = _make_config(
+            protocol="anthropic", wire_api="messages",
+            base_url="https://api.anthropic.com",
+        )
+        client = UpstreamClient(cfg)
+        headers = client._build_headers(extra_headers=None)
+        assert headers["anthropic-version"] == "2023-06-01"
+        assert "anthropic-beta" not in headers
+
+
 class TestUpstreamClientSend:
 
     @pytest.mark.asyncio

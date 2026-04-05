@@ -17,6 +17,17 @@ from .upstream.client import UpstreamClient
 
 logger = logging.getLogger(__name__)
 
+_FORWARD_HEADER_NAMES = frozenset({"anthropic-beta", "anthropic-version"})
+
+
+def _extract_forward_headers(request: Request) -> dict[str, str] | None:
+    """提取需要透传给上游的请求头（anthropic-beta 等）"""
+    headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() in _FORWARD_HEADER_NAMES
+    }
+    return headers or None
+
 
 def create_app(config_path: str = "config.toml") -> FastAPI:
 
@@ -55,6 +66,7 @@ def create_app(config_path: str = "config.toml") -> FastAPI:
                 request.app.state.upstream_clients,
                 header_provider=request.headers.get(PROVIDER_HEADER),
                 model_aliases=request.app.state.model_aliases,
+                forward_headers=_extract_forward_headers(request),
             )
         except GatewayError as e:
             return format_error_response(
@@ -75,6 +87,7 @@ def create_app(config_path: str = "config.toml") -> FastAPI:
                 request.app.state.upstream_clients,
                 header_provider=request.headers.get(PROVIDER_HEADER),
                 model_aliases=request.app.state.model_aliases,
+                forward_headers=_extract_forward_headers(request),
             )
         except GatewayError as e:
             return format_error_response(
@@ -95,6 +108,7 @@ def create_app(config_path: str = "config.toml") -> FastAPI:
                 request.app.state.upstream_clients,
                 header_provider=request.headers.get(PROVIDER_HEADER),
                 model_aliases=request.app.state.model_aliases,
+                forward_headers=_extract_forward_headers(request),
             )
         except GatewayError as e:
             return format_error_response(

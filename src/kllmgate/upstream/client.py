@@ -37,19 +37,26 @@ class UpstreamClient:
         suffix = _ENDPOINT_MAP.get(key, "/chat/completions")
         self._endpoint = f"{config.base_url}{suffix}"
 
-    def _build_headers(self) -> dict[str, str]:
+    def _build_headers(
+        self, extra_headers: dict[str, str] | None = None,
+    ) -> dict[str, str]:
         api_key = self.config.resolve_api_key()
         headers = {"Content-Type": "application/json"}
         if self.config.protocol == "anthropic":
             headers["x-api-key"] = api_key
             headers["anthropic-version"] = "2023-06-01"
+            if extra_headers:
+                headers.update(extra_headers)
         else:
             headers["Authorization"] = f"Bearer {api_key}"
         return headers
 
-    async def send(self, body: dict) -> dict:
+    async def send(
+        self, body: dict,
+        extra_headers: dict[str, str] | None = None,
+    ) -> dict:
         """发送非流式请求，返回解析后的 JSON 响应"""
-        headers = self._build_headers()
+        headers = self._build_headers(extra_headers)
         last_error: Exception | None = None
 
         for attempt in range(self.config.max_retries + 1):
@@ -103,9 +110,10 @@ class UpstreamClient:
 
     async def send_stream(
         self, body: dict,
+        extra_headers: dict[str, str] | None = None,
     ) -> AsyncIterator[SseEvent]:
         """发送流式请求，yield 已完成分帧的 SSE 事件"""
-        headers = self._build_headers()
+        headers = self._build_headers(extra_headers)
         last_error: Exception | None = None
 
         for attempt in range(self.config.max_retries + 1):

@@ -2,11 +2,13 @@
 
 import json
 import textwrap
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.datastructures import Headers
 
-from kllmgate.app import create_app
+from kllmgate.app import _extract_forward_headers, create_app
 
 
 @pytest.fixture
@@ -139,6 +141,75 @@ class TestRoutes:
             return
         if resp.status_code == 400:
             assert resp.json()["error"]["code"] != "invalid_model_format"
+
+
+class TestHealthCheck:
+
+    def test_head_anthropic_returns_200(self, client):
+        resp = client.head("/anthropic")
+        assert resp.status_code == 200
+
+    def test_head_openai_returns_200(self, client):
+        resp = client.head("/openai")
+        assert resp.status_code == 200
+
+    def test_get_anthropic_returns_200(self, client):
+        resp = client.get("/anthropic")
+        assert resp.status_code == 200
+
+    def test_head_unknown_returns_404(self, client):
+        resp = client.head("/unknown")
+        assert resp.status_code == 404
+
+
+class TestExtractForwardHeaders:
+
+    @staticmethod
+    def _make_request(**headers):
+        req = MagicMock()
+        req.headers = Headers(headers=headers)
+        return req
+
+    def test_extracts_anthropic_beta(self):
+        req = self._make_request(
+            **{"anthropic-beta": "output-128k-2025-02-19"},
+        )
+        result = _extract_forward_headers(req)
+        assert result == {"anthropic-beta": "output-128k-2025-02-19"}
+
+    def test_extracts_anthropic_version(self):
+        req = self._make_request(
+            **{"anthropic-version": "2024-10-22"},
+        )
+        result = _extract_forward_headers(req)
+        assert result == {"anthropic-version": "2024-10-22"}
+
+    def test_extracts_multiple_headers(self):
+        req = self._make_request(**{
+            "anthropic-beta": "some-beta",
+            "anthropic-version": "2024-10-22",
+        })
+        result = _extract_forward_headers(req)
+        assert result == {
+            "anthropic-beta": "some-beta",
+            "anthropic-version": "2024-10-22",
+        }
+
+    def test_returns_none_when_no_matching_headers(self):
+        req = self._make_request(
+            **{"content-type": "application/json"},
+        )
+        result = _extract_forward_headers(req)
+        assert result is None
+
+    def test_ignores_unrelated_headers(self):
+        req = self._make_request(**{
+            "authorization": "Bearer sk-xxx",
+            "anthropic-beta": "some-beta",
+            "x-custom": "value",
+        })
+        result = _extract_forward_headers(req)
+        assert result == {"anthropic-beta": "some-beta"}
 
 
 class TestModelAliasRoutes:

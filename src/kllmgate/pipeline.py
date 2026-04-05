@@ -312,6 +312,7 @@ async def process_request(
     upstream_clients: dict[str, UpstreamClient],
     header_provider: str | None = None,
     model_aliases: dict[str, str] | None = None,
+    forward_headers: dict[str, str] | None = None,
 ) -> JSONResponse | StreamingResponse:
     request_id = uuid.uuid4().hex
     start_time = time.monotonic()
@@ -363,7 +364,9 @@ async def process_request(
 
         if is_stream:
             stream_usage: dict = {}
-            upstream_events = client.send_stream(upstream_body)
+            upstream_events = client.send_stream(
+                upstream_body, extra_headers=forward_headers,
+            )
             try:
                 first_event = await anext(upstream_events)
             except StopAsyncIteration:
@@ -392,7 +395,9 @@ async def process_request(
                 },
             )
 
-        upstream_response = await client.send(upstream_body)
+        upstream_response = await client.send(
+            upstream_body, extra_headers=forward_headers,
+        )
         converted = converter.convert_response(upstream_response)
         _log_request(
             request_id, inbound_format, provider_name,
