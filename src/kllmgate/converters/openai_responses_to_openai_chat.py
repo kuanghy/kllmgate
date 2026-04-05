@@ -22,6 +22,32 @@ logger = logging.getLogger(__name__)
 
 class OpenaiResponsesToOpenaiChatConverter(Converter):
 
+    @staticmethod
+    def _normalize_tools(tools: list[dict]) -> list[dict]:
+        """将 Responses API 工具定义转为 Chat Completions 格式
+
+        Responses: {"type": "function", "name": "...", "parameters": {...}}
+        Chat:      {"type": "function", "function": {"name": "...", "parameters": {...}}}
+
+        过滤掉非 function 类型（如 web_search）
+        """
+        result = []
+        for t in tools:
+            if t.get("type") != "function":
+                continue
+            if "function" in t:
+                result.append(t)
+            else:
+                func = {
+                    k: v for k, v in t.items()
+                    if k not in ("type", "strict")
+                }
+                entry: dict = {"type": "function", "function": func}
+                if "strict" in t:
+                    entry["function"]["strict"] = t["strict"]
+                result.append(entry)
+        return result
+
     def convert_request(self, body: dict, model: str) -> dict:
         system_contents: list[str] = []
         if body.get("instructions"):
@@ -29,6 +55,7 @@ class OpenaiResponsesToOpenaiChatConverter(Converter):
 
         tools = body.get("tools")
         if tools:
+            tools = self._normalize_tools(tools)
             prompt_add, tools_field = (
                 self.tool_adapter.convert_tool_definitions(tools)
             )
@@ -36,7 +63,7 @@ class OpenaiResponsesToOpenaiChatConverter(Converter):
                 system_contents.append(prompt_add)
                 tools = None
             else:
-                tools = tools_field
+                tools = tools_field or None
 
         raw_messages: list[dict] = []
         pending_calls: list[dict] = []
