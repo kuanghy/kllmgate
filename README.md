@@ -96,4 +96,4 @@ python -m pytest tests -v --tb=short --color=no
 
 ## 说明
 
-根目录旧文件 `kllmgate.py` 目前仅作为历史实现保留，不再是推荐入口。当前应使用包入口 `python -m kllmgate` 或命令 `kllmgate` 启动。
+旧单文件实现已移至 `scripts/kllmgate_legacy.py`，仅作为历史参考保留。当前应使用包入口 `python -m kllmgate` 或命令 `kllmgate` 启动。
