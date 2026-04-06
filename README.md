@@ -44,6 +44,13 @@ pip install -e .
 创建 `config.toml`：
 
 ```toml
+# 服务配置（可选，CLI 参数可覆盖）
+[server]
+# host = "0.0.0.0"
+# port = 8500
+# log_level = "info"
+# default_provider = "openai_official"
+
 [providers.openai_official]
 base_url = "https://api.openai.com/v1"
 env_key = "OPENAI_API_KEY"
@@ -78,7 +85,7 @@ kllmgate --config config.toml
 - `POST /openai/responses`
 - `POST /anthropic/v1/messages`
 
-客户端指定模型提供商有三种方式（按优先级从高到低）：
+客户端指定模型提供商有四种方式（按优先级从高到低）：
 
 **方式一：`provider/model` 格式（推荐）**
 
@@ -116,3 +123,18 @@ curl -H "X-KLLMGate-Provider: minimax_proxy" \
 ```
 
 该 header 仅在网关层消费，不会透传到上游。
+
+**方式四：配置默认 Provider**
+
+在 `[server]` 段设置 `default_provider` 作为兜底路由，客户端无需指定 provider：
+
+```toml
+[server]
+default_provider = "openai_official"
+```
+
+```json
+{
+  "model": "gpt-4.1"
+}
+```

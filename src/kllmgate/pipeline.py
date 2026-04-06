@@ -117,6 +117,7 @@ def resolve_provider_and_model(
     model_ref: str,
     header_provider: str | None,
     model_aliases: dict[str, str],
+    default_provider: str | None = None,
 ) -> tuple[str, str]:
     """解析 provider 和上游模型名
 
@@ -124,7 +125,8 @@ def resolve_provider_and_model(
     1. model 含 "/" → 直接拆分
     2. model 命中 model_aliases → 展开后拆分
     3. X-KLLMGate-Provider header → header 做 provider，model 原样做上游模型名
-    4. 均不满足 → 抛出 ConfigError
+    4. default_provider 配置 → 兜底路由
+    5. 均不满足 → 抛出 ConfigError
 
     当 model 含 "/" 且 header 也存在但两者 provider 不一致时，以 model 为准。
     """
@@ -151,6 +153,9 @@ def resolve_provider_and_model(
 
     if header_provider:
         return header_provider, model_ref
+
+    if default_provider:
+        return default_provider, model_ref
 
     raise ConfigError(
         f"cannot determine provider for model {model_ref!r}: "
@@ -312,6 +317,7 @@ async def process_request(
     upstream_clients: dict[str, UpstreamClient],
     header_provider: str | None = None,
     model_aliases: dict[str, str] | None = None,
+    default_provider: str | None = None,
     forward_headers: dict[str, str] | None = None,
 ) -> JSONResponse | StreamingResponse:
     request_id = uuid.uuid4().hex
@@ -324,6 +330,7 @@ async def process_request(
         model_ref = body.get("model", "")
         provider_name, upstream_model = resolve_provider_and_model(
             model_ref, header_provider, model_aliases or {},
+            default_provider=default_provider,
         )
 
         if provider_name not in providers:

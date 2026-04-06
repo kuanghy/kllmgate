@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from starlette.datastructures import Headers
 
 from kllmgate.app import _extract_forward_headers, create_app
+from kllmgate.config import load_config
 
 
 @pytest.fixture
@@ -31,7 +32,7 @@ def config_file(tmp_path):
 
 @pytest.fixture
 def app(config_file):
-    return create_app(config_path=config_file)
+    return create_app(load_config(config_file))
 
 
 @pytest.fixture
@@ -230,7 +231,7 @@ class TestModelAliasRoutes:
 
     @pytest.fixture
     def alias_client(self, alias_config_file):
-        app = create_app(config_path=alias_config_file)
+        app = create_app(load_config(alias_config_file))
         with TestClient(app) as c:
             yield c
 

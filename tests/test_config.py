@@ -29,10 +29,10 @@ class TestLoadConfig:
             protocol = "openai"
             wire_api = "chat"
         """)
-        providers, aliases = load_config(path)
-        assert aliases == {}
-        assert len(providers) == 1
-        cfg = providers["openai_official"]
+        config = load_config(path)
+        assert config.model_aliases == {}
+        assert len(config.providers) == 1
+        cfg = config.providers["openai_official"]
         assert cfg.name == "openai_official"
         assert cfg.base_url == "https://api.openai.com/v1"
         assert cfg.api_key == "sk-test"
@@ -46,8 +46,8 @@ class TestLoadConfig:
             api_key = "sk-ant-test"
             protocol = "anthropic"
         """)
-        providers, _ = load_config(path)
-        cfg = providers["anthropic_official"]
+        config = load_config(path)
+        cfg = config.providers["anthropic_official"]
         assert cfg.protocol == "anthropic"
         assert cfg.wire_api == "messages"
 
@@ -63,10 +63,10 @@ class TestLoadConfig:
             api_key = "sk-2"
             protocol = "anthropic"
         """)
-        providers, _ = load_config(path)
-        assert len(providers) == 2
-        assert "openai" in providers
-        assert "anthropic" in providers
+        config = load_config(path)
+        assert len(config.providers) == 2
+        assert "openai" in config.providers
+        assert "anthropic" in config.providers
 
     def test_default_values(self, toml_file):
         path = toml_file("""\
@@ -75,8 +75,8 @@ class TestLoadConfig:
             api_key = "sk-test"
             protocol = "openai"
         """)
-        providers, _ = load_config(path)
-        cfg = providers["test"]
+        config = load_config(path)
+        cfg = config.providers["test"]
         assert cfg.wire_api == "chat"
         assert cfg.tool_style == "standard"
         assert cfg.timeout_seconds == 120
@@ -95,8 +95,8 @@ class TestLoadConfig:
             max_retries = 5
             models = ["model-a", "model-b"]
         """)
-        providers, _ = load_config(path)
-        cfg = providers["minimax"]
+        config = load_config(path)
+        cfg = config.providers["minimax"]
         assert cfg.tool_style == "minimax_xml"
         assert cfg.timeout_seconds == 60
         assert cfg.max_retries == 5
@@ -109,8 +109,8 @@ class TestLoadConfig:
             api_key = "sk-test"
             protocol = "openai"
         """)
-        providers, _ = load_config(path)
-        assert providers["test"].base_url == "https://api.example.com/v1"
+        config = load_config(path)
+        assert config.providers["test"].base_url == "https://api.example.com/v1"
 
     def test_env_key_config(self, toml_file, monkeypatch):
         monkeypatch.setenv("MY_API_KEY", "sk-from-env")
@@ -120,8 +120,8 @@ class TestLoadConfig:
             env_key = "MY_API_KEY"
             protocol = "openai"
         """)
-        providers, _ = load_config(path)
-        cfg = providers["test"]
+        config = load_config(path)
+        cfg = config.providers["test"]
         assert cfg.env_key == "MY_API_KEY"
         assert cfg.resolve_api_key() == "sk-from-env"
 
@@ -235,8 +235,8 @@ class TestLoadConfigValidation:
             protocol = "openai"
             wire_api = "responses"
         """)
-        providers, _ = load_config(path)
-        cfg = providers["test"]
+        config = load_config(path)
+        cfg = config.providers["test"]
         assert cfg.wire_api == "responses"
         from kllmgate.models import ProtocolFormat
         assert cfg.protocol_format == ProtocolFormat.OPENAI_RESPONSES
@@ -252,8 +252,8 @@ class TestLoadConfigValidation:
             "MiniMax-M2.5" = "scnet/MiniMax-M2.5"
             "gpt-4" = "scnet/gpt-4"
         """)
-        _, aliases = load_config(path)
-        assert aliases == {
+        config = load_config(path)
+        assert config.model_aliases == {
             "MiniMax-M2.5": "scnet/MiniMax-M2.5",
             "gpt-4": "scnet/gpt-4",
         }
@@ -265,8 +265,8 @@ class TestLoadConfigValidation:
             api_key = "sk-test"
             protocol = "openai"
         """)
-        _, aliases = load_config(path)
-        assert aliases == {}
+        config = load_config(path)
+        assert config.model_aliases == {}
 
     def test_model_aliases_invalid_target_format_raises(self, toml_file):
         path = toml_file("""\
@@ -290,6 +290,131 @@ class TestLoadConfigValidation:
 
             [model_aliases]
             "gpt-4" = "nonexistent/gpt-4"
+        """)
+        with pytest.raises(ConfigError, match="nonexistent"):
+            load_config(path)
+
+
+class TestServerConfig:
+
+    def test_server_defaults_when_section_omitted(self, toml_file):
+        path = toml_file("""\
+            [providers.test]
+            base_url = "https://api.example.com"
+            api_key = "sk-test"
+            protocol = "openai"
+        """)
+        config = load_config(path)
+        assert config.server.host == "0.0.0.0"
+        assert config.server.port == 8500
+        assert config.server.log_level == "info"
+
+    def test_server_custom_values(self, toml_file):
+        path = toml_file("""\
+            [server]
+            host = "127.0.0.1"
+            port = 9000
+            log_level = "debug"
+
+            [providers.test]
+            base_url = "https://api.example.com"
+            api_key = "sk-test"
+            protocol = "openai"
+        """)
+        config = load_config(path)
+        assert config.server.host == "127.0.0.1"
+        assert config.server.port == 9000
+        assert config.server.log_level == "debug"
+
+    def test_server_partial_values(self, toml_file):
+        path = toml_file("""\
+            [server]
+            port = 3000
+
+            [providers.test]
+            base_url = "https://api.example.com"
+            api_key = "sk-test"
+            protocol = "openai"
+        """)
+        config = load_config(path)
+        assert config.server.host == "0.0.0.0"
+        assert config.server.port == 3000
+        assert config.server.log_level == "info"
+
+    def test_invalid_log_level_raises(self, toml_file):
+        path = toml_file("""\
+            [server]
+            log_level = "verbose"
+
+            [providers.test]
+            base_url = "https://api.example.com"
+            api_key = "sk-test"
+            protocol = "openai"
+        """)
+        with pytest.raises(ConfigError, match="log_level"):
+            load_config(path)
+
+    def test_invalid_port_raises(self, toml_file):
+        path = toml_file("""\
+            [server]
+            port = 0
+
+            [providers.test]
+            base_url = "https://api.example.com"
+            api_key = "sk-test"
+            protocol = "openai"
+        """)
+        with pytest.raises(ConfigError, match="port"):
+            load_config(path)
+
+    def test_port_exceeding_max_raises(self, toml_file):
+        path = toml_file("""\
+            [server]
+            port = 70000
+
+            [providers.test]
+            base_url = "https://api.example.com"
+            api_key = "sk-test"
+            protocol = "openai"
+        """)
+        with pytest.raises(ConfigError, match="port"):
+            load_config(path)
+
+
+class TestDefaultProvider:
+
+    def test_default_provider_parsed(self, toml_file):
+        path = toml_file("""\
+            [server]
+            default_provider = "test"
+
+            [providers.test]
+            base_url = "https://api.example.com"
+            api_key = "sk-test"
+            protocol = "openai"
+        """)
+        config = load_config(path)
+        assert config.default_provider == "test"
+
+    def test_default_provider_none_when_omitted(self, toml_file):
+        path = toml_file("""\
+            [providers.test]
+            base_url = "https://api.example.com"
+            api_key = "sk-test"
+            protocol = "openai"
+        """)
+        config = load_config(path)
+        assert config.default_provider is None
+
+    def test_default_provider_unknown_raises(self, toml_file):
+        path = toml_file("""\
+            [server]
+            default_provider = "nonexistent"
+
+            [providers.test]
+            base_url = "https://api.example.com"
+            api_key = "sk-test"
+            protocol = "openai"
         """)
         with pytest.raises(ConfigError, match="nonexistent"):
             load_config(path)

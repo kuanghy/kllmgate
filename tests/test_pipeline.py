@@ -124,6 +124,31 @@ class TestResolveProviderAndModel:
         p, m = resolve_provider_and_model("org/ns/model-v2", None, {})
         assert (p, m) == ("org", "ns/model-v2")
 
+    def test_default_provider_fallback(self):
+        p, m = resolve_provider_and_model(
+            "gpt-4", None, {}, default_provider="openai",
+        )
+        assert (p, m) == ("openai", "gpt-4")
+
+    def test_header_takes_priority_over_default_provider(self):
+        p, m = resolve_provider_and_model(
+            "gpt-4", "scnet", {}, default_provider="openai",
+        )
+        assert (p, m) == ("scnet", "gpt-4")
+
+    def test_alias_takes_priority_over_default_provider(self):
+        aliases = {"gpt-4": "anthropic/gpt-4"}
+        p, m = resolve_provider_and_model(
+            "gpt-4", None, aliases, default_provider="openai",
+        )
+        assert (p, m) == ("anthropic", "gpt-4")
+
+    def test_bare_model_no_default_provider_raises(self):
+        with pytest.raises(ConfigError, match="cannot determine provider"):
+            resolve_provider_and_model(
+                "gpt-4", None, {}, default_provider=None,
+            )
+
 
 class TestProcessRequest:
 
@@ -210,7 +235,7 @@ class TestProcessRequest:
 
         providers = {"test": _cfg()}
 
-        async def _fake_stream(body):
+        async def _fake_stream(body, extra_headers=None):
             return
             yield
 
@@ -235,13 +260,13 @@ class TestProcessRequest:
 
         providers = {"test": _cfg()}
 
-        async def _failing_stream(body):
+        async def _failing_stream(body, extra_headers=None):
             raise UpstreamHTTPError(401, "Unauthorized")
             yield
 
         class _Client:
-            def send_stream(self, body):
-                return _failing_stream(body)
+            def send_stream(self, body, extra_headers=None):
+                return _failing_stream(body, extra_headers=extra_headers)
 
         with pytest.raises(UpstreamHTTPError):
             await process_request(

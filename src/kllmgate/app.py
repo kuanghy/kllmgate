@@ -9,9 +9,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from .config import load_config
 from .errors import GatewayError, ProtocolError, format_error_response
-from .models import ProtocolFormat
+from .models import GatewayConfig, ProtocolFormat
 from .pipeline import PROVIDER_HEADER, process_request
 from .upstream.client import UpstreamClient
 
@@ -29,23 +28,27 @@ def _extract_forward_headers(request: Request) -> dict[str, str] | None:
     return headers or None
 
 
-def create_app(config_path: str = "config.toml") -> FastAPI:
+def create_app(config: GatewayConfig) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        providers, model_aliases = load_config(config_path)
         clients: dict[str, UpstreamClient] = {}
-        for name, cfg in providers.items():
+        for name, cfg in config.providers.items():
             clients[name] = UpstreamClient(cfg)
             logger.info(
                 "Initialized upstream client: %s (%s)",
                 name, cfg.protocol_format.value,
             )
-        app.state.providers = providers
+        app.state.providers = config.providers
         app.state.upstream_clients = clients
-        app.state.model_aliases = model_aliases
-        if model_aliases:
-            logger.info("Loaded %d model alias(es)", len(model_aliases))
+        app.state.model_aliases = config.model_aliases
+        app.state.default_provider = config.default_provider
+        if config.model_aliases:
+            logger.info("Loaded %d model alias(es)", len(config.model_aliases))
+        if config.default_provider:
+            logger.info(
+                "Default provider: %s", config.default_provider,
+            )
         yield
         for client in clients.values():
             await client.close()
@@ -66,6 +69,7 @@ def create_app(config_path: str = "config.toml") -> FastAPI:
                 request.app.state.upstream_clients,
                 header_provider=request.headers.get(PROVIDER_HEADER),
                 model_aliases=request.app.state.model_aliases,
+                default_provider=request.app.state.default_provider,
                 forward_headers=_extract_forward_headers(request),
             )
         except GatewayError as e:
@@ -87,6 +91,7 @@ def create_app(config_path: str = "config.toml") -> FastAPI:
                 request.app.state.upstream_clients,
                 header_provider=request.headers.get(PROVIDER_HEADER),
                 model_aliases=request.app.state.model_aliases,
+                default_provider=request.app.state.default_provider,
                 forward_headers=_extract_forward_headers(request),
             )
         except GatewayError as e:
@@ -108,6 +113,7 @@ def create_app(config_path: str = "config.toml") -> FastAPI:
                 request.app.state.upstream_clients,
                 header_provider=request.headers.get(PROVIDER_HEADER),
                 model_aliases=request.app.state.model_aliases,
+                default_provider=request.app.state.default_provider,
                 forward_headers=_extract_forward_headers(request),
             )
         except GatewayError as e:

@@ -6,21 +6,15 @@ import tomllib
 from pathlib import Path
 
 from .errors import ConfigError
-from .models import ProviderConfig
+from .models import GatewayConfig, ProviderConfig, ServerConfig
 
 _VALID_PROTOCOLS = {"openai", "anthropic"}
 _VALID_WIRE_APIS = {"chat", "responses", "messages"}
+_VALID_LOG_LEVELS = {"debug", "info", "warning", "error"}
 
 
-def load_config(
-    path: str,
-) -> tuple[dict[str, ProviderConfig], dict[str, str]]:
-    """加载并校验 TOML 配置文件
-
-    Returns:
-        (providers, model_aliases) 二元组；providers 为名称到配置的映射，
-        model_aliases 将裸模型名映射到 provider/model 全限定名
-    """
+def load_config(path: str) -> GatewayConfig:
+    """加载并校验 TOML 配置文件"""
     config_path = Path(path)
     if not config_path.exists():
         raise ConfigError(
@@ -30,6 +24,8 @@ def load_config(
 
     with open(config_path, "rb") as f:
         raw = tomllib.load(f)
+
+    server = _parse_server(raw)
 
     if "providers" not in raw:
         raise ConfigError(
@@ -49,7 +45,53 @@ def load_config(
         providers[name] = _parse_provider(name, section)
 
     model_aliases = _parse_model_aliases(raw, providers)
-    return providers, model_aliases
+    _validate_default_provider(server, providers)
+
+    return GatewayConfig(
+        server=server,
+        providers=providers,
+        model_aliases=model_aliases,
+    )
+
+
+def _parse_server(raw: dict) -> ServerConfig:
+    """解析 [server] 段，所有字段均可选"""
+    section = raw.get("server", {})
+    log_level = section.get("log_level", "info")
+    if log_level not in _VALID_LOG_LEVELS:
+        raise ConfigError(
+            f"server: invalid log_level {log_level!r}, "
+            f"must be one of {_VALID_LOG_LEVELS}",
+            code="invalid_log_level",
+        )
+    port = section.get("port", 8500)
+    if not isinstance(port, int) or not (1 <= port <= 65535):
+        raise ConfigError(
+            f"server: invalid port {port!r}, must be 1-65535",
+            code="invalid_port",
+        )
+    return ServerConfig(
+        host=section.get("host", "0.0.0.0"),
+        port=port,
+        log_level=log_level,
+        default_provider=section.get("default_provider"),
+    )
+
+
+def _validate_default_provider(
+    server: ServerConfig,
+    providers: dict[str, ProviderConfig],
+) -> None:
+    """校验 default_provider 指向已配置的 provider"""
+    if (
+        server.default_provider is not None
+        and server.default_provider not in providers
+    ):
+        raise ConfigError(
+            f"default_provider {server.default_provider!r} "
+            f"not found in providers",
+            code="unknown_default_provider",
+        )
 
 
 def _parse_provider(name: str, section: dict) -> ProviderConfig:

@@ -1,5 +1,7 @@
 """核心数据模型"""
 
+from __future__ import annotations
+
 import os
 from dataclasses import dataclass, field
 from enum import Enum
@@ -9,6 +11,14 @@ class ProtocolFormat(str, Enum):
     OPENAI_CHAT = "openai.chat"
     OPENAI_RESPONSES = "openai.responses"
     ANTHROPIC_MESSAGES = "anthropic.messages"
+
+
+@dataclass
+class ServerConfig:
+    host: str = "0.0.0.0"
+    port: int = 8500
+    log_level: str = "info"
+    default_provider: str | None = None
 
 
 @dataclass
@@ -57,3 +67,14 @@ class ProviderConfig:
             f"set api_key or env_key in config",
             code="api_key_not_configured",
         )
+
+
+@dataclass
+class GatewayConfig:
+    server: ServerConfig
+    providers: dict[str, ProviderConfig]
+    model_aliases: dict[str, str]
+
+    @property
+    def default_provider(self) -> str | None:
+        return self.server.default_provider

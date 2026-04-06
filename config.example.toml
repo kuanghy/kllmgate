@@ -6,6 +6,14 @@
 # 启动：
 #   python -m kllmgate --config config.toml
 
+# ─── 服务配置 ───
+# 所有字段均可选，host/port/log_level 可被 CLI 参数覆盖
+# [server]
+# host = "0.0.0.0"                      # 监听地址（默认 0.0.0.0）
+# port = 8500                           # 监听端口（默认 8500）
+# log_level = "info"                    # 日志级别（默认 info）：debug | info | warning | error
+# default_provider = "openai_official"  # 客户端未指定 provider 时的兜底路由（可选）
+
 # ─── OpenAI 官方 ───
 [providers.openai_official]
 base_url = "https://api.openai.com/v1"
@@ -57,7 +65,7 @@ max_retries = 5
 #
 # ─── 客户端模型路由 ───
 #
-# 客户端指定模型提供商有三种方式（按优先级从高到低）：
+# 客户端指定模型提供商有四种方式（按优先级从高到低）：
 #
 # 1. model 字段使用 provider/model 格式：
 #      { "model": "openai_official/gpt-4.1" }
@@ -70,3 +78,8 @@ max_retries = 5
 # 3. 通过 X-KLLMGate-Provider 请求头指定：
 #      X-KLLMGate-Provider: minimax_proxy
 #    配合裸模型名 { "model": "MiniMax-M2.5" } 使用
+#
+# 4. 在 [server] 段配置 default_provider 作为兜底路由：
+#      [server]
+#      default_provider = "openai_official"
+#    客户端无需指定 provider，裸模型名直接路由到默认 provider
