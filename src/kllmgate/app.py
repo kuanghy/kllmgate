@@ -7,7 +7,6 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
 
 from .errors import GatewayError, ProtocolError, format_error_response
 from .models import GatewayConfig, ProtocolFormat

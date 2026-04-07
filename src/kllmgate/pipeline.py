@@ -37,7 +37,8 @@ from .converters.anthropic_messages_to_openai_responses import (
     AnthropicMessagesToOpenaiResponsesConverter,
 )
 from .errors import (
-    ConfigError, ConversionError, GatewayError, UpstreamError,
+    ConfigError, ConversionError, GatewayError,
+    UpstreamError, UpstreamHTTPError,
 )
 from .models import ProtocolFormat, ProviderConfig
 from .sse import SseEvent, format_data_only_sse, format_named_sse
@@ -46,8 +47,31 @@ from .toolcall.standard import StandardToolAdapter
 from .toolcall.minimax_xml import MinimaxXmlToolAdapter
 from .toolcall.anthropic import AnthropicToolAdapter
 from .upstream.client import UpstreamClient
+from .utils import text_shorten
 
 PF = ProtocolFormat
+
+
+def _strip_system_prompt(body: dict, fmt: ProtocolFormat) -> None:
+    """就地移除上游请求体中的 system prompt"""
+    if fmt == PF.OPENAI_CHAT:
+        body["messages"] = [
+            m for m in body.get("messages", [])
+            if m.get("role") != "system"
+        ]
+    elif fmt == PF.OPENAI_RESPONSES:
+        body.pop("instructions", None)
+        if isinstance(body.get("input"), list):
+            body["input"] = [
+                item for item in body["input"]
+                if not (
+                    isinstance(item, dict)
+                    and item.get("role") == "developer"
+                )
+            ]
+    elif fmt == PF.ANTHROPIC_MESSAGES:
+        body.pop("system", None)
+
 
 CONVERTER_REGISTRY: dict[
     tuple[ProtocolFormat, ProtocolFormat],
@@ -354,6 +378,8 @@ async def process_request(
         )
 
         upstream_body = converter.convert_request(body, upstream_model)
+        if provider.strip_system_prompt:
+            _strip_system_prompt(upstream_body, upstream_format)
         logger.debug(
             "Upstream request: request_id=%s provider=%s model=%s "
             "converter=%s",
@@ -419,8 +445,14 @@ async def process_request(
             upstream_model, is_stream, start_time,
             {}, "error", e.error_type,
         )
-        if isinstance(e, (UpstreamError, ConversionError)):
-            logger.error(
+        if isinstance(e, UpstreamHTTPError):
+            logger.warning(
+                "%s: %s | upstream_body=%s",
+                type(e).__name__, e.message,
+                text_shorten(e.upstream_body, 200) if e.upstream_body else "",
+            )
+        elif isinstance(e, (UpstreamError, ConversionError)):
+            logger.warning(
                 "%s: %s", type(e).__name__, e.message,
             )
         raise

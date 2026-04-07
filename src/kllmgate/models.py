@@ -33,6 +33,7 @@ class ProviderConfig:
     timeout_seconds: int = 120
     max_retries: int = 2
     models: list[str] | None = None
+    strip_system_prompt: bool = False
 
     def __post_init__(self):
         if self.wire_api is None:

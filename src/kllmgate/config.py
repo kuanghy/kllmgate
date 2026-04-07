@@ -144,6 +144,7 @@ def _parse_provider(name: str, section: dict) -> ProviderConfig:
         timeout_seconds=section.get("timeout_seconds", 120),
         max_retries=section.get("max_retries", 2),
         models=section.get("models"),
+        strip_system_prompt=section.get("strip_system_prompt", False),
     )
     # 启动阶段提前验证 API key，避免服务在不可用配置下成功启动
     provider.resolve_api_key()
