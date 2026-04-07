@@ -277,3 +277,68 @@ class TestProcessRequest:
                 providers,
                 {"test": _Client()},
             )
+
+    @pytest.mark.asyncio
+    async def test_strip_inbound_system_prompt_openai_chat(self, httpx_mock):
+        from kllmgate.upstream.client import UpstreamClient
+
+        providers = {"test": _cfg(strip_system_prompt=True)}
+        client = UpstreamClient(providers["test"])
+        clients = {"test": client}
+
+        httpx_mock.add_response(json={
+            "id": "chatcmpl-1",
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {},
+        })
+
+        req_body = {
+            "model": "test/gpt-4",
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "developer", "content": "dev"},
+                {"role": "user", "content": "hello"},
+            ],
+        }
+        await process_request(
+            PF.OPENAI_CHAT, req_body, providers, clients,
+        )
+        assert len(req_body["messages"]) == 1
+        assert req_body["messages"][0]["role"] == "user"
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_strip_inbound_system_prompt_openai_responses(self, httpx_mock):
+        from kllmgate.upstream.client import UpstreamClient
+
+        providers = {"test": _cfg(
+            protocol="openai", wire_api="responses",
+            strip_system_prompt=True,
+        )}
+        client = UpstreamClient(providers["test"])
+        clients = {"test": client}
+
+        httpx_mock.add_response(json={
+            "id": "resp-1",
+            "status": "completed",
+            "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]}],
+        })
+
+        req_body = {
+            "model": "test/gpt-4",
+            "instructions": "sys desc",
+            "input": [
+                {"role": "system", "content": "sys"},
+                {"role": "developer", "content": "dev"},
+                {"role": "user", "content": "hello"},
+                "direct text",
+            ],
+        }
+        await process_request(
+            PF.OPENAI_RESPONSES, req_body, providers, clients,
+        )
+        assert "instructions" not in req_body
+        assert len(req_body["input"]) == 2
+        assert req_body["input"][0].get("role") == "user"
+        assert req_body["input"][1] == "direct text"
+        await client.close()

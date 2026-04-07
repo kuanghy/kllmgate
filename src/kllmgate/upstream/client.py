@@ -17,11 +17,32 @@ logger = logging.getLogger(__name__)
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503}
 _NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404}
 
+_FORWARD_UPSTREAM_HEADERS = frozenset({
+    "retry-after",
+    "x-request-id",
+    "request-id",
+    "x-ratelimit-limit-requests",
+    "x-ratelimit-limit-tokens",
+    "x-ratelimit-remaining-requests",
+    "x-ratelimit-remaining-tokens",
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-reset-tokens",
+})
+
 _ENDPOINT_MAP = {
     ("openai", "chat"): "/chat/completions",
     ("openai", "responses"): "/responses",
     ("anthropic", "messages"): "/v1/messages",
 }
+
+
+def _collect_forward_headers(
+    resp: httpx.Response,
+) -> dict[str, str]:
+    return {
+        k: v for k, v in resp.headers.items()
+        if k.lower() in _FORWARD_UPSTREAM_HEADERS
+    }
 
 
 class UpstreamClient:
@@ -96,10 +117,16 @@ class UpstreamClient:
                     )
                     await asyncio.sleep(wait)
                     continue
-                raise UpstreamHTTPError(resp.status_code, resp.text)
+                raise UpstreamHTTPError(
+                    resp.status_code, resp.text,
+                    _collect_forward_headers(resp),
+                )
 
             if resp.status_code >= 400:
-                raise UpstreamHTTPError(resp.status_code, resp.text)
+                raise UpstreamHTTPError(
+                    resp.status_code, resp.text,
+                    _collect_forward_headers(resp),
+                )
 
             return resp.json()
 
@@ -141,13 +168,19 @@ class UpstreamClient:
                         await resp.aclose()
                         await asyncio.sleep(wait)
                         continue
-                    raise UpstreamHTTPError(resp.status_code, body_text)
+                    raise UpstreamHTTPError(
+                        resp.status_code, body_text,
+                        _collect_forward_headers(resp),
+                    )
 
                 if resp.status_code >= 400:
                     body_text = (await resp.aread()).decode(
                         errors="replace",
                     )
-                    raise UpstreamHTTPError(resp.status_code, body_text)
+                    raise UpstreamHTTPError(
+                        resp.status_code, body_text,
+                        _collect_forward_headers(resp),
+                    )
 
                 async def _line_iter() -> AsyncIterator[str]:
                     async for line in resp.aiter_lines():

@@ -52,12 +52,12 @@ from .utils import text_shorten
 PF = ProtocolFormat
 
 
-def _strip_system_prompt(body: dict, fmt: ProtocolFormat) -> None:
-    """就地移除上游请求体中的 system prompt"""
+def _strip_inbound_system_prompt(body: dict, fmt: ProtocolFormat) -> None:
+    """按入站协议就地移除请求体中的系统指令"""
     if fmt == PF.OPENAI_CHAT:
         body["messages"] = [
             m for m in body.get("messages", [])
-            if m.get("role") != "system"
+            if m.get("role") not in ("system", "developer")
         ]
     elif fmt == PF.OPENAI_RESPONSES:
         body.pop("instructions", None)
@@ -66,7 +66,7 @@ def _strip_system_prompt(body: dict, fmt: ProtocolFormat) -> None:
                 item for item in body["input"]
                 if not (
                     isinstance(item, dict)
-                    and item.get("role") == "developer"
+                    and item.get("role") in ("system", "developer")
                 )
             ]
     elif fmt == PF.ANTHROPIC_MESSAGES:
@@ -377,9 +377,9 @@ async def process_request(
             inbound_format, upstream_format, tool_adapter,
         )
 
-        upstream_body = converter.convert_request(body, upstream_model)
         if provider.strip_system_prompt:
-            _strip_system_prompt(upstream_body, upstream_format)
+            _strip_inbound_system_prompt(body, inbound_format)
+        upstream_body = converter.convert_request(body, upstream_model)
         logger.debug(
             "Upstream request: request_id=%s provider=%s model=%s "
             "converter=%s",

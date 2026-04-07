@@ -47,15 +47,55 @@ class UpstreamError(GatewayError):
     code = "upstream_error"
 
 
-class UpstreamHTTPError(UpstreamError):
-    """上游 HTTP 错误，携带原始状态码和响应体"""
+def _extract_upstream_error_fields(raw: str) -> dict:
+    """从上游错误响应体中提取结构化字段
 
-    def __init__(self, upstream_status: int, upstream_body: str):
+    支持 OpenAI 和 Anthropic 两种错误格式，非 JSON 响应截断返回。
+    """
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return {"message": raw[:200].strip()}
+
+    error = data.get("error")
+    if isinstance(error, dict):
+        return {
+            k: v for k, v in {
+                "message": error.get("message", ""),
+                "type": error.get("type", ""),
+                "code": error.get("code"),
+                "param": error.get("param"),
+            }.items() if v
+        }
+    if isinstance(error, str):
+        return {"message": error}
+    if "message" in data:
+        return {"message": data["message"]}
+    return {}
+
+
+class UpstreamHTTPError(UpstreamError):
+    """上游 HTTP 错误，携带原始状态码、响应体和响应头"""
+
+    def __init__(
+        self,
+        upstream_status: int,
+        upstream_body: str,
+        upstream_headers: dict[str, str] | None = None,
+    ):
         self.upstream_status = upstream_status
         self.upstream_body = upstream_body
-        super().__init__(
-            f"upstream returned HTTP {upstream_status}",
-            code="upstream_http_error",
+        self.upstream_headers = upstream_headers or {}
+        self.upstream_fields = _extract_upstream_error_fields(upstream_body)
+        msg = (
+            self.upstream_fields.get("message")
+            or f"upstream returned HTTP {upstream_status}"
+        )
+        super().__init__(msg, code="upstream_http_error")
+        self.status_code = (
+            upstream_status if 400 <= upstream_status < 600 else 502
         )
 
 
@@ -67,44 +107,49 @@ class ConversionError(GatewayError):
     code = "conversion_error"
 
 
-def _parse_upstream_body(raw: str) -> dict | str:
-    """尝试将上游响应体解析为 JSON，失败则返回原始字符串"""
-    try:
-        return json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        return raw
+_ERROR_SOURCE_HEADER = "X-KLLMGate-Error-Source"
 
 
 def format_error_response(
     error: GatewayError,
     inbound_format: ProtocolFormat,
 ) -> JSONResponse:
-    upstream_detail = None
-    if isinstance(error, UpstreamHTTPError) and error.upstream_body:
-        upstream_detail = {
-            "status": error.upstream_status,
-            "body": _parse_upstream_body(error.upstream_body),
-        }
+    response_headers: dict[str, str] = {}
+
+    if isinstance(error, UpstreamHTTPError):
+        fields = error.upstream_fields
+        message = fields.get("message") or error.message
+        error_type = fields.get("type") or error.error_type
+        error_code = str(fields.get("code") or error.code)
+        status_code = error.status_code
+        response_headers[_ERROR_SOURCE_HEADER] = "upstream"
+        for k, v in error.upstream_headers.items():
+            response_headers[k] = v
+    else:
+        message = error.message
+        error_type = error.error_type
+        error_code = error.code
+        status_code = error.status_code
 
     if inbound_format == ProtocolFormat.ANTHROPIC_MESSAGES:
         body: dict = {
             "type": "error",
             "error": {
-                "type": error.error_type,
-                "message": error.message,
+                "type": error_type,
+                "message": message,
             },
         }
-        if upstream_detail:
-            body["error"]["upstream"] = upstream_detail
     else:
         body = {
             "error": {
-                "type": error.error_type,
-                "code": error.code,
-                "message": error.message,
+                "type": error_type,
+                "code": error_code,
+                "message": message,
             },
         }
-        if upstream_detail:
-            body["error"]["upstream"] = upstream_detail
 
-    return JSONResponse(status_code=error.status_code, content=body)
+    return JSONResponse(
+        status_code=status_code,
+        content=body,
+        headers=response_headers or None,
+    )
