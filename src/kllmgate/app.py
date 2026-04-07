@@ -132,3 +132,19 @@ def create_app(config: GatewayConfig) -> FastAPI:
         return Response(status_code=200)
 
     return app
+
+
+def create_app_auto() -> FastAPI:
+    """自动加载配置并创建应用，供 gunicorn/uvicorn import-string 部署使用
+
+    配置文件查找规则同 CLI，支持 KLLMGATE_CONFIG 环境变量指定路径。
+
+    用法：
+        gunicorn "kllmgate.app:create_app_auto()" -k uvicorn.workers.UvicornWorker
+        uvicorn "kllmgate.app:create_app_auto" --factory
+    """
+    from .__main__ import _resolve_config
+    from .config import load_config
+
+    config_path = _resolve_config(None)
+    return create_app(load_config(config_path))
