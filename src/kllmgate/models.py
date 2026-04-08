@@ -30,6 +30,7 @@ class ProviderConfig:
     env_key: str | None = None
     wire_api: str | None = None
     tool_style: str = "standard"
+    thinking_style: str = "disabled"
     timeout_seconds: int = 120
     max_retries: int = 2
     models: list[str] | None = None

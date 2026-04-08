@@ -9,8 +9,12 @@ from ..sse import SseEvent
 class Converter(ABC):
     """协议转换器基类"""
 
-    def __init__(self, tool_adapter):
+    def __init__(self, tool_adapter, thinking_extractor=None):
         self.tool_adapter = tool_adapter
+        if thinking_extractor is None:
+            from ..thinking import NullThinkingExtractor
+            thinking_extractor = NullThinkingExtractor()
+        self.thinking_extractor = thinking_extractor
 
     @abstractmethod
     def convert_request(self, body: dict, model: str) -> dict:

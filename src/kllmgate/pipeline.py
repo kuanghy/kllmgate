@@ -42,9 +42,16 @@ from .errors import (
 )
 from .models import ProtocolFormat, ProviderConfig
 from .sse import SseEvent, format_data_only_sse, format_named_sse
+from .thinking import (
+    ThinkingExtractor, NullThinkingExtractor,
+    ThinkTagExtractor, ThinkingTokenExtractor, LvlEntryThinkingExtractor,
+)
 from .toolcall import ToolAdapter
 from .toolcall.standard import StandardToolAdapter
 from .toolcall.minimax_xml import MinimaxXmlToolAdapter
+from .toolcall.deepseek import DeepseekToolAdapter
+from .toolcall.qwen import QwenToolAdapter
+from .toolcall.deepseek_qwen import DeepseekQwenToolAdapter
 from .toolcall.anthropic import AnthropicToolAdapter
 from .upstream.client import UpstreamClient
 from .utils import text_shorten
@@ -88,12 +95,36 @@ CONVERTER_REGISTRY: dict[
 }
 
 
+def get_thinking_extractor(provider: ProviderConfig) -> ThinkingExtractor:
+    match provider.thinking_style:
+        case "disabled":
+            return NullThinkingExtractor()
+        case "think":
+            return ThinkTagExtractor()
+        case "thinking_token":
+            return ThinkingTokenExtractor()
+        case "lvl_entry":
+            return LvlEntryThinkingExtractor()
+        case _:
+            raise ConfigError(
+                f"unknown thinking_style for provider {provider.name!r}: "
+                f"{provider.thinking_style!r}",
+                code="invalid_thinking_style",
+            )
+
+
 def get_tool_adapter(provider: ProviderConfig) -> ToolAdapter:
     if provider.protocol == "anthropic":
         return AnthropicToolAdapter()
     match provider.tool_style:
         case "minimax_xml":
             return MinimaxXmlToolAdapter()
+        case "deepseek":
+            return DeepseekToolAdapter()
+        case "qwen":
+            return QwenToolAdapter()
+        case "deepseek_qwen":
+            return DeepseekQwenToolAdapter()
         case "standard":
             return StandardToolAdapter()
         case _:
@@ -108,12 +139,16 @@ def get_converter(
     inbound_format: ProtocolFormat,
     upstream_format: ProtocolFormat,
     tool_adapter: ToolAdapter,
+    thinking_extractor: ThinkingExtractor | None = None,
 ) -> Converter:
     if (
         inbound_format == upstream_format
         and isinstance(tool_adapter, StandardToolAdapter)
+        and isinstance(
+            thinking_extractor, (NullThinkingExtractor, type(None)),
+        )
     ):
-        return PassthroughConverter(tool_adapter)
+        return PassthroughConverter(tool_adapter, thinking_extractor)
 
     key = (inbound_format, upstream_format)
     converter_cls = CONVERTER_REGISTRY.get(key)
@@ -122,7 +157,7 @@ def get_converter(
             f"no converter for {inbound_format} -> {upstream_format}",
             code="unsupported_conversion",
         )
-    return converter_cls(tool_adapter)
+    return converter_cls(tool_adapter, thinking_extractor)
 
 
 async def _replay_prefetched_stream(
@@ -382,8 +417,10 @@ async def process_request(
 
         upstream_format = provider.protocol_format
         tool_adapter = get_tool_adapter(provider)
+        thinking_extractor = get_thinking_extractor(provider)
         converter = get_converter(
-            inbound_format, upstream_format, tool_adapter,
+            inbound_format, upstream_format,
+            tool_adapter, thinking_extractor,
         )
 
         if provider.strip_system_prompt:

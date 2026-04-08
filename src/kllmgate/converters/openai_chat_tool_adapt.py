@@ -1,4 +1,4 @@
-"""同协议工具适配转换器：OpenAI Chat → OpenAI Chat（tool_style 适配）"""
+"""同协议工具适配转换器：OpenAI Chat → OpenAI Chat（tool_style + thinking_style 适配）"""
 
 from __future__ import annotations
 
@@ -52,12 +52,32 @@ class OpenaiChatToolAdaptConverter(Converter):
 
         choice = choices[0]
         message = choice.get("message", {})
-        content_text, tool_calls = (
-            self.tool_adapter.extract_tool_calls(message)
-        )
+
+        if message.get("reasoning_content") is not None:
+            reasoning = ""
+            content_text, tool_calls = (
+                self.tool_adapter.extract_tool_calls(message)
+            )
+        else:
+            raw_content = message.get("content", "") or ""
+            reasoning, remaining = (
+                self.thinking_extractor.extract(raw_content)
+            )
+            content_text, tool_calls = (
+                self.tool_adapter.extract_tool_calls(
+                    {"content": remaining},
+                )
+            )
+
+        if not tool_calls and not reasoning:
+            return response
+
+        new_message = {**message, "content": content_text}
+        if reasoning:
+            new_message["reasoning_content"] = reasoning
+        new_choice = {**choice, "message": new_message}
 
         if tool_calls:
-            new_message = {**message, "content": content_text}
             new_message["tool_calls"] = [{
                 "id": tc["id"],
                 "type": "function",
@@ -66,12 +86,10 @@ class OpenaiChatToolAdaptConverter(Converter):
                     "arguments": tc["arguments"],
                 },
             } for tc in tool_calls]
-            new_choice = {**choice, "message": new_message}
             if choice.get("finish_reason") == "stop":
                 new_choice["finish_reason"] = "tool_calls"
-            return {**response, "choices": [new_choice]}
 
-        return response
+        return {**response, "choices": [new_choice]}
 
     async def convert_stream(
         self,
@@ -82,6 +100,21 @@ class OpenaiChatToolAdaptConverter(Converter):
         full_text = ""
         sent_pos = 0
         sent_role = False
+
+        think_buf = self.thinking_extractor.stream_buffer_size
+        phase = "content" if think_buf == 0 else "detecting"
+        thinking_end_pos = 0
+
+        def _chunk(delta: dict, finish_reason=None) -> str:
+            ch: dict = {"index": 0, "delta": delta}
+            if finish_reason is not None:
+                ch["finish_reason"] = finish_reason
+            return format_data_only_sse({
+                "id": resp_id,
+                "object": "chat.completion.chunk",
+                "model": model_name,
+                "choices": [ch],
+            })
 
         async for event in upstream_events:
             if event.data == "[DONE]":
@@ -103,83 +136,134 @@ class OpenaiChatToolAdaptConverter(Converter):
 
             if delta.get("role") == "assistant" and not sent_role:
                 sent_role = True
-                yield format_data_only_sse({
-                    "id": resp_id,
-                    "object": "chat.completion.chunk",
-                    "model": model_name,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"role": "assistant"},
-                    }],
-                })
+                yield _chunk({"role": "assistant"})
+
+            rc = delta.get("reasoning_content", "")
+            if rc:
+                yield _chunk({"reasoning_content": rc})
 
             delta_text = delta.get("content", "")
             if delta_text:
                 full_text += delta_text
-                buf_size = self.tool_adapter.stream_buffer_size
-                boundary = self.tool_adapter.detect_stream_tool_boundary(
-                    full_text,
-                )
-                if boundary is not None:
-                    safe_end = boundary
-                elif buf_size > 0:
-                    safe_end = max(
-                        sent_pos, len(full_text) - buf_size,
+
+                if phase == "detecting":
+                    open_tag = (
+                        self.thinking_extractor.find_open_tag(full_text)
                     )
-                else:
-                    safe_end = len(full_text)
-                unsent = full_text[sent_pos:safe_end]
-                if unsent:
-                    yield format_data_only_sse({
-                        "id": resp_id,
-                        "object": "chat.completion.chunk",
-                        "model": model_name,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": unsent},
-                        }],
-                    })
-                    sent_pos = safe_end
+                    if open_tag is not None:
+                        tag_start, content_start = open_tag
+                        pre = full_text[sent_pos:tag_start]
+                        if pre.strip():
+                            yield _chunk({"content": pre})
+                        sent_pos = content_start
+                        phase = "thinking"
+                    else:
+                        safe = max(
+                            sent_pos, len(full_text) - think_buf,
+                        )
+                        unsent = full_text[sent_pos:safe]
+                        if unsent:
+                            yield _chunk({"content": unsent})
+                            sent_pos = safe
+
+                if phase == "thinking":
+                    close_tag = (
+                        self.thinking_extractor.find_close_tag(
+                            full_text, sent_pos,
+                        )
+                    )
+                    if close_tag is not None:
+                        content_end, tag_end = close_tag
+                        unsent = full_text[sent_pos:content_end]
+                        if unsent:
+                            yield _chunk({"reasoning_content": unsent})
+                        thinking_end_pos = tag_end
+                        sent_pos = tag_end
+                        phase = "content"
+                    else:
+                        safe = max(
+                            sent_pos,
+                            len(full_text) - think_buf,
+                        )
+                        unsent = full_text[sent_pos:safe]
+                        if unsent:
+                            yield _chunk({"reasoning_content": unsent})
+                            sent_pos = safe
+
+                if phase == "content":
+                    content_area = full_text[thinking_end_pos:]
+                    boundary = (
+                        self.tool_adapter
+                        .detect_stream_tool_boundary(content_area)
+                    )
+                    if boundary is not None:
+                        safe = thinking_end_pos + boundary
+                    elif self.tool_adapter.stream_buffer_size > 0:
+                        safe = max(
+                            sent_pos,
+                            len(full_text)
+                            - self.tool_adapter.stream_buffer_size,
+                        )
+                    else:
+                        safe = len(full_text)
+                    unsent = full_text[sent_pos:safe]
+                    if unsent:
+                        yield _chunk({"content": unsent})
+                        sent_pos = safe
 
             if finish_reason:
-                clean_text, tool_calls = self.tool_adapter.extract_tool_calls(
-                    {"content": full_text},
-                )
-                remaining = clean_text[sent_pos:]
-                if remaining:
-                    yield format_data_only_sse({
-                        "id": resp_id,
-                        "object": "chat.completion.chunk",
-                        "model": model_name,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": remaining},
-                        }],
-                    })
+                if phase == "thinking":
+                    unsent = full_text[sent_pos:]
+                    if unsent:
+                        yield _chunk({"reasoning_content": unsent})
+                    yield _chunk({}, finish_reason)
+                    yield "data: [DONE]\n\n"
+                    return
+
+                if phase == "detecting":
+                    reasoning, remaining = (
+                        self.thinking_extractor.extract(full_text)
+                    )
+                    if reasoning:
+                        yield _chunk(
+                            {"reasoning_content": reasoning},
+                        )
+                    clean_text, tool_calls = (
+                        self.tool_adapter.extract_tool_calls(
+                            {"content": remaining},
+                        )
+                    )
+                    remaining_content = clean_text[sent_pos:]
+                else:
+                    content_portion = full_text[thinking_end_pos:]
+                    clean_text, tool_calls = (
+                        self.tool_adapter.extract_tool_calls(
+                            {"content": content_portion},
+                        )
+                    )
+                    content_sent = max(
+                        0, sent_pos - thinking_end_pos,
+                    )
+                    remaining_content = clean_text[content_sent:]
+
+                if remaining_content:
+                    yield _chunk({"content": remaining_content})
+
                 final_delta: dict = {}
-                mapped_finish_reason = finish_reason
+                mapped_finish = finish_reason
                 if tool_calls:
                     final_delta["tool_calls"] = [{
-                        "index": index,
+                        "index": idx,
                         "id": tc["id"],
                         "type": "function",
                         "function": {
                             "name": tc["name"],
                             "arguments": tc["arguments"],
                         },
-                    } for index, tc in enumerate(tool_calls)]
-                    mapped_finish_reason = "tool_calls"
+                    } for idx, tc in enumerate(tool_calls)]
+                    mapped_finish = "tool_calls"
 
-                yield format_data_only_sse({
-                    "id": resp_id,
-                    "object": "chat.completion.chunk",
-                    "model": model_name,
-                    "choices": [{
-                        "index": 0,
-                        "delta": final_delta,
-                        "finish_reason": mapped_finish_reason,
-                    }],
-                })
+                yield _chunk(final_delta, mapped_finish)
                 yield "data: [DONE]\n\n"
                 return
 

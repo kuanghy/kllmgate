@@ -1,4 +1,8 @@
-"""Anthropic Messages → OpenAI Chat Completions 转换器"""
+"""Anthropic Messages → OpenAI Chat Completions 转换器
+
+响应方向（Chat → Anthropic）通过 tool_adapter / thinking_extractor 处理
+文本中的工具调用和思考标签，转换为 Anthropic 的 tool_use / thinking 块。
+"""
 
 from __future__ import annotations
 
@@ -12,6 +16,69 @@ from ._helpers import (
     OPENAI_FINISH_TO_ANTHROPIC,
 )
 from ..sse import SseEvent, format_named_sse
+
+
+def _thinking_block_start(idx: int) -> str:
+    return format_named_sse("content_block_start", {
+        "type": "content_block_start",
+        "index": idx,
+        "content_block": {"type": "thinking", "thinking": ""},
+    })
+
+
+def _thinking_block_delta(idx: int, text: str) -> str:
+    return format_named_sse("content_block_delta", {
+        "type": "content_block_delta",
+        "index": idx,
+        "delta": {"type": "thinking_delta", "thinking": text},
+    })
+
+
+def _text_block_start(idx: int) -> str:
+    return format_named_sse("content_block_start", {
+        "type": "content_block_start",
+        "index": idx,
+        "content_block": {"type": "text", "text": ""},
+    })
+
+
+def _text_block_delta(idx: int, text: str) -> str:
+    return format_named_sse("content_block_delta", {
+        "type": "content_block_delta",
+        "index": idx,
+        "delta": {"type": "text_delta", "text": text},
+    })
+
+
+def _tool_block_start(idx: int, tc_id: str, name: str) -> str:
+    return format_named_sse("content_block_start", {
+        "type": "content_block_start",
+        "index": idx,
+        "content_block": {
+            "type": "tool_use",
+            "id": tc_id,
+            "name": name,
+            "input": {},
+        },
+    })
+
+
+def _tool_block_delta(idx: int, partial_json: str) -> str:
+    return format_named_sse("content_block_delta", {
+        "type": "content_block_delta",
+        "index": idx,
+        "delta": {
+            "type": "input_json_delta",
+            "partial_json": partial_json,
+        },
+    })
+
+
+def _block_stop(idx: int) -> str:
+    return format_named_sse("content_block_stop", {
+        "type": "content_block_stop",
+        "index": idx,
+    })
 
 
 class AnthropicMessagesToOpenaiChatConverter(Converter):
@@ -130,6 +197,8 @@ class AnthropicMessagesToOpenaiChatConverter(Converter):
 
         return result
 
+    # ── 非流式响应 ──
+
     def convert_response(self, response: dict) -> dict:
         choices = response.get("choices", [])
         if not choices:
@@ -138,15 +207,45 @@ class AnthropicMessagesToOpenaiChatConverter(Converter):
         choice = choices[0]
         message = choice.get("message", {})
         finish_reason = choice.get("finish_reason", "stop")
-        content_text = message.get("content", "") or ""
-        raw_tool_calls = message.get("tool_calls", [])
+        raw_content = message.get("content", "") or ""
+        existing_reasoning = message.get("reasoning_content")
+        existing_tool_calls = message.get("tool_calls", [])
 
-        content_blocks = []
+        if existing_reasoning is not None:
+            reasoning = existing_reasoning
+            text_for_tools = raw_content
+        else:
+            reasoning, text_for_tools = (
+                self.thinking_extractor.extract(raw_content)
+            )
+
+        if existing_tool_calls:
+            content_text = text_for_tools
+            tool_calls_raw = existing_tool_calls
+        else:
+            content_text, extracted = (
+                self.tool_adapter.extract_tool_calls(
+                    {"content": text_for_tools},
+                )
+            )
+            tool_calls_raw = [{
+                "id": tc["id"],
+                "function": {
+                    "name": tc["name"],
+                    "arguments": tc["arguments"],
+                },
+            } for tc in extracted]
+
+        content_blocks: list[dict] = []
+        if reasoning:
+            content_blocks.append(
+                {"type": "thinking", "thinking": reasoning},
+            )
         if content_text:
             content_blocks.append(
                 {"type": "text", "text": content_text},
             )
-        for tc in raw_tool_calls:
+        for tc in tool_calls_raw:
             func = tc.get("function", {})
             args_str = func.get("arguments", "{}")
             try:
@@ -160,9 +259,12 @@ class AnthropicMessagesToOpenaiChatConverter(Converter):
                 "input": args,
             })
 
-        stop_reason = OPENAI_FINISH_TO_ANTHROPIC.get(
-            finish_reason, "end_turn",
-        )
+        if tool_calls_raw:
+            stop_reason = "tool_use"
+        else:
+            stop_reason = OPENAI_FINISH_TO_ANTHROPIC.get(
+                finish_reason, "end_turn",
+            )
         usage = response.get("usage", {})
 
         return {
@@ -188,6 +290,8 @@ class AnthropicMessagesToOpenaiChatConverter(Converter):
             "usage": chat_usage_to_anthropic(response.get("usage", {})),
         }
 
+    # ── 流式响应 ──
+
     async def convert_stream(
         self,
         upstream_events: AsyncIterator[SseEvent],
@@ -195,6 +299,13 @@ class AnthropicMessagesToOpenaiChatConverter(Converter):
         resp_id = ""
         model_name = ""
         content_index = 0
+        block_open: str | None = None
+
+        full_text = ""
+        sent_pos = 0
+        think_buf = self.thinking_extractor.stream_buffer_size
+        phase = "content" if think_buf == 0 else "detecting"
+        thinking_end_pos = 0
 
         async for event in upstream_events:
             if event.data == "[DONE]":
@@ -222,64 +333,301 @@ class AnthropicMessagesToOpenaiChatConverter(Converter):
                         "role": "assistant",
                         "model": model_name,
                         "content": [],
-                        "usage": {"input_tokens": 0, "output_tokens": 0},
+                        "usage": {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                        },
                     },
                 })
-                yield format_named_sse("content_block_start", {
-                    "type": "content_block_start",
-                    "index": content_index,
-                    "content_block": {"type": "text", "text": ""},
-                })
+                if think_buf == 0:
+                    yield _text_block_start(content_index)
+                    block_open = "text"
 
-            if "content" in delta and delta["content"]:
-                yield format_named_sse("content_block_delta", {
-                    "type": "content_block_delta",
-                    "index": content_index,
-                    "delta": {
-                        "type": "text_delta",
-                        "text": delta["content"],
-                    },
-                })
+            rc = delta.get("reasoning_content", "")
+            if rc:
+                if block_open != "thinking":
+                    if block_open is not None:
+                        yield _block_stop(content_index)
+                        content_index += 1
+                    yield _thinking_block_start(content_index)
+                    block_open = "thinking"
+                yield _thinking_block_delta(content_index, rc)
+
+            delta_text = delta.get("content", "")
+            if delta_text:
+                full_text += delta_text
+
+                if phase == "detecting":
+                    open_tag = (
+                        self.thinking_extractor.find_open_tag(full_text)
+                    )
+                    if open_tag is not None:
+                        tag_start, content_start = open_tag
+                        pre = full_text[sent_pos:tag_start]
+                        if pre.strip():
+                            if block_open != "text":
+                                if block_open is not None:
+                                    yield _block_stop(content_index)
+                                    content_index += 1
+                                yield _text_block_start(content_index)
+                                block_open = "text"
+                            yield _text_block_delta(content_index, pre)
+                            yield _block_stop(content_index)
+                            content_index += 1
+                            block_open = None
+                        elif block_open is not None:
+                            yield _block_stop(content_index)
+                            content_index += 1
+                            block_open = None
+                        yield _thinking_block_start(content_index)
+                        block_open = "thinking"
+                        sent_pos = content_start
+                        phase = "thinking"
+                    else:
+                        safe = max(
+                            sent_pos, len(full_text) - think_buf,
+                        )
+                        unsent = full_text[sent_pos:safe]
+                        if unsent:
+                            if block_open != "text":
+                                if block_open is not None:
+                                    yield _block_stop(content_index)
+                                    content_index += 1
+                                yield _text_block_start(content_index)
+                                block_open = "text"
+                            yield _text_block_delta(
+                                content_index, unsent,
+                            )
+                            sent_pos = safe
+
+                if phase == "thinking":
+                    close_tag = (
+                        self.thinking_extractor.find_close_tag(
+                            full_text, sent_pos,
+                        )
+                    )
+                    if close_tag is not None:
+                        content_end, tag_end = close_tag
+                        unsent = full_text[sent_pos:content_end]
+                        if unsent:
+                            if block_open != "thinking":
+                                if block_open is not None:
+                                    yield _block_stop(content_index)
+                                    content_index += 1
+                                yield _thinking_block_start(
+                                    content_index,
+                                )
+                                block_open = "thinking"
+                            yield _thinking_block_delta(
+                                content_index, unsent,
+                            )
+                        if block_open == "thinking":
+                            yield _block_stop(content_index)
+                            content_index += 1
+                            block_open = None
+                        thinking_end_pos = tag_end
+                        sent_pos = tag_end
+                        phase = "content"
+                    else:
+                        safe = max(
+                            sent_pos,
+                            len(full_text) - think_buf,
+                        )
+                        unsent = full_text[sent_pos:safe]
+                        if unsent:
+                            if block_open != "thinking":
+                                if block_open is not None:
+                                    yield _block_stop(content_index)
+                                    content_index += 1
+                                yield _thinking_block_start(
+                                    content_index,
+                                )
+                                block_open = "thinking"
+                            yield _thinking_block_delta(
+                                content_index, unsent,
+                            )
+                            sent_pos = safe
+
+                if phase == "content":
+                    content_area = full_text[thinking_end_pos:]
+                    boundary = (
+                        self.tool_adapter
+                        .detect_stream_tool_boundary(content_area)
+                    )
+                    if boundary is not None:
+                        safe = thinking_end_pos + boundary
+                    elif self.tool_adapter.stream_buffer_size > 0:
+                        safe = max(
+                            sent_pos,
+                            len(full_text)
+                            - self.tool_adapter.stream_buffer_size,
+                        )
+                    else:
+                        safe = len(full_text)
+                    unsent = full_text[sent_pos:safe]
+                    if unsent:
+                        if block_open != "text":
+                            if block_open is not None:
+                                yield _block_stop(content_index)
+                                content_index += 1
+                            yield _text_block_start(content_index)
+                            block_open = "text"
+                        yield _text_block_delta(
+                            content_index, unsent,
+                        )
+                        sent_pos = safe
 
             if "tool_calls" in delta:
+                if block_open is not None:
+                    yield _block_stop(content_index)
+                    content_index += 1
+                    block_open = None
                 for tc_delta in delta["tool_calls"]:
                     func = tc_delta.get("function", {})
                     if func.get("name"):
-                        content_index += 1
-                        yield format_named_sse("content_block_start", {
-                            "type": "content_block_start",
-                            "index": content_index,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": tc_delta.get("id", ""),
-                                "name": func["name"],
-                                "input": {},
-                            },
-                        })
+                        yield _tool_block_start(
+                            content_index,
+                            tc_delta.get("id", ""),
+                            func["name"],
+                        )
+                        block_open = "tool_use"
                     if func.get("arguments"):
-                        yield format_named_sse("content_block_delta", {
-                            "type": "content_block_delta",
-                            "index": content_index,
-                            "delta": {
-                                "type": "input_json_delta",
-                                "partial_json": func["arguments"],
-                            },
-                        })
+                        yield _tool_block_delta(
+                            content_index,
+                            func["arguments"],
+                        )
 
             if finish_reason:
-                yield format_named_sse("content_block_stop", {
-                    "type": "content_block_stop",
-                    "index": content_index,
-                })
-                stop_reason = OPENAI_FINISH_TO_ANTHROPIC.get(
-                    finish_reason, "end_turn",
+                for ev in self._finish_stream(
+                    finish_reason, chunk,
+                    full_text, sent_pos, phase,
+                    thinking_end_pos, block_open, content_index,
+                ):
+                    yield ev
+                return
+
+        if block_open is not None:
+            yield _block_stop(content_index)
+        yield format_named_sse("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 0},
+        })
+        yield format_named_sse("message_stop", {
+            "type": "message_stop",
+        })
+
+    def _finish_stream(
+        self,
+        finish_reason: str,
+        chunk: dict,
+        full_text: str,
+        sent_pos: int,
+        phase: str,
+        thinking_end_pos: int,
+        block_open: str | None,
+        content_index: int,
+    ):
+        """生成流式响应结尾事件"""
+        tool_calls: list[dict] = []
+
+        if phase == "thinking":
+            unsent = full_text[sent_pos:]
+            if unsent:
+                if block_open != "thinking":
+                    if block_open is not None:
+                        yield _block_stop(content_index)
+                        content_index += 1
+                    yield _thinking_block_start(content_index)
+                    block_open = "thinking"
+                yield _thinking_block_delta(content_index, unsent)
+            if block_open is not None:
+                yield _block_stop(content_index)
+                content_index += 1
+                block_open = None
+
+        elif phase == "detecting":
+            reasoning, remaining = (
+                self.thinking_extractor.extract(full_text)
+            )
+            if reasoning:
+                if block_open is not None:
+                    yield _block_stop(content_index)
+                    content_index += 1
+                    block_open = None
+                yield _thinking_block_start(content_index)
+                yield _thinking_block_delta(content_index, reasoning)
+                yield _block_stop(content_index)
+                content_index += 1
+            clean_text, extracted = (
+                self.tool_adapter.extract_tool_calls(
+                    {"content": remaining},
                 )
-                usage = chunk.get("usage", {})
-                yield format_named_sse("message_delta", {
-                    "type": "message_delta",
-                    "delta": {"stop_reason": stop_reason},
-                    "usage": chat_usage_to_anthropic(usage),
-                })
-                yield format_named_sse("message_stop", {
-                    "type": "message_stop",
-                })
+            )
+            tool_calls = extracted
+            remaining_content = clean_text[sent_pos:]
+            if remaining_content:
+                if block_open != "text":
+                    if block_open is not None:
+                        yield _block_stop(content_index)
+                        content_index += 1
+                    yield _text_block_start(content_index)
+                    block_open = "text"
+                yield _text_block_delta(
+                    content_index, remaining_content,
+                )
+            if block_open is not None:
+                yield _block_stop(content_index)
+                content_index += 1
+                block_open = None
+
+        else:
+            content_portion = full_text[thinking_end_pos:]
+            clean_text, extracted = (
+                self.tool_adapter.extract_tool_calls(
+                    {"content": content_portion},
+                )
+            )
+            tool_calls = extracted
+            content_sent = max(0, sent_pos - thinking_end_pos)
+            remaining_content = clean_text[content_sent:]
+            if remaining_content:
+                if block_open != "text":
+                    if block_open is not None:
+                        yield _block_stop(content_index)
+                        content_index += 1
+                    yield _text_block_start(content_index)
+                    block_open = "text"
+                yield _text_block_delta(
+                    content_index, remaining_content,
+                )
+            if block_open is not None:
+                yield _block_stop(content_index)
+                content_index += 1
+                block_open = None
+
+        for tc in tool_calls:
+            args_str = tc["arguments"]
+            yield _tool_block_start(
+                content_index, tc["id"], tc["name"],
+            )
+            yield _tool_block_delta(content_index, args_str)
+            yield _block_stop(content_index)
+            content_index += 1
+
+        if tool_calls:
+            stop_reason = "tool_use"
+        else:
+            stop_reason = OPENAI_FINISH_TO_ANTHROPIC.get(
+                finish_reason, "end_turn",
+            )
+
+        usage = chunk.get("usage", {})
+        yield format_named_sse("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason},
+            "usage": chat_usage_to_anthropic(usage),
+        })
+        yield format_named_sse("message_stop", {
+            "type": "message_stop",
+        })

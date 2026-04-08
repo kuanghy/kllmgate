@@ -42,14 +42,44 @@ class AnthropicMessagesToOpenaiResponsesConverter(Converter):
         chat_resp = c2r.convert_response(response)
 
         message = chat_resp.get("choices", [{}])[0].get("message", {})
-        content_text = message.get("content", "") or ""
+        raw_content = message.get("content", "") or ""
         finish_reason = (
             chat_resp.get("choices", [{}])[0]
             .get("finish_reason", "stop")
         )
-        tool_calls_raw = message.get("tool_calls", [])
+        existing_reasoning = message.get("reasoning_content")
+        existing_tool_calls = message.get("tool_calls", [])
 
-        content_blocks = []
+        if existing_reasoning is not None:
+            reasoning = existing_reasoning
+            text_for_tools = raw_content
+        else:
+            reasoning, text_for_tools = (
+                self.thinking_extractor.extract(raw_content)
+            )
+
+        if existing_tool_calls:
+            content_text = text_for_tools
+            tool_calls_raw = existing_tool_calls
+        else:
+            content_text, extracted = (
+                self.tool_adapter.extract_tool_calls(
+                    {"content": text_for_tools},
+                )
+            )
+            tool_calls_raw = [{
+                "id": tc["id"],
+                "function": {
+                    "name": tc["name"],
+                    "arguments": tc["arguments"],
+                },
+            } for tc in extracted]
+
+        content_blocks: list[dict] = []
+        if reasoning:
+            content_blocks.append(
+                {"type": "thinking", "thinking": reasoning},
+            )
         if content_text:
             content_blocks.append(
                 {"type": "text", "text": content_text},
@@ -71,9 +101,12 @@ class AnthropicMessagesToOpenaiResponsesConverter(Converter):
         if not content_blocks:
             content_blocks.append({"type": "text", "text": ""})
 
-        stop_reason = OPENAI_FINISH_TO_ANTHROPIC.get(
-            finish_reason, "end_turn",
-        )
+        if tool_calls_raw:
+            stop_reason = "tool_use"
+        else:
+            stop_reason = OPENAI_FINISH_TO_ANTHROPIC.get(
+                finish_reason, "end_turn",
+            )
         usage = chat_resp.get("usage", {})
 
         return {
