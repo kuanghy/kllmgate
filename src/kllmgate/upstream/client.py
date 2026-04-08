@@ -212,9 +212,15 @@ class UpstreamClient:
         self, body: dict,
         extra_headers: dict[str, str] | None = None,
     ) -> AsyncIterator[SseEvent]:
-        """发送流式请求，yield 已完成分帧的 SSE 事件"""
+        """发送流式请求，yield 已完成分帧的 SSE 事件
+
+        仅在连接建立阶段（状态码返回前）和收到可重试状态码时重试。
+        一旦开始 yield 事件，中断将直接抛出异常，不再重试，
+        避免重试导致事件重复发送。
+        """
         headers = self._build_headers(extra_headers)
         last_error: Exception | None = None
+        streaming_started = False
 
         for attempt in range(self.config.max_retries + 1):
             resp: httpx.Response | None = None
@@ -288,9 +294,15 @@ class UpstreamClient:
                         yield line
 
                 async for event in parse_sse_events(_line_iter()):
+                    streaming_started = True
                     yield event
                 return
             except httpx.RequestError as e:
+                if streaming_started:
+                    raise UpstreamError(
+                        f"stream interrupted after partial delivery: {e}",
+                        code="upstream_stream_interrupted",
+                    ) from e
                 last_error = e
                 if attempt < self.config.max_retries:
                     wait = self._backoff(attempt)

@@ -121,10 +121,21 @@ class MinimaxXmlToolAdapter(ToolAdapter):
             return raw_content, []
 
         calls = []
-        for block in _MINIMAX_TC_RE.findall(raw_content):
-            for invoke_body in _INVOKE_RE.findall(block):
+        blocks = _MINIMAX_TC_RE.findall(raw_content)
+        for block in blocks:
+            invokes = _INVOKE_RE.findall(block)
+            if not invokes:
+                logger.warning(
+                    "tool_call block has no <invoke>: %.200s", block,
+                )
+                continue
+            for invoke_body in invokes:
                 name_match = re.search(r"^([^>]+)", invoke_body)
                 if not name_match:
+                    logger.warning(
+                        "Failed to parse invoke name: %.200s",
+                        invoke_body,
+                    )
                     continue
                 func_name = _strip_quotes(name_match.group(1))
 
@@ -135,6 +146,11 @@ class MinimaxXmlToolAdapter(ToolAdapter):
                         k = _strip_quotes(kv.group(1))
                         v = _coerce_param_value(kv.group(2))
                         params[k] = v
+                    else:
+                        logger.warning(
+                            "Failed to parse parameter in %r: %.200s",
+                            func_name, param_body,
+                        )
 
                 calls.append({
                     "id": f"call_{uuid.uuid4().hex[:24]}",
@@ -143,6 +159,12 @@ class MinimaxXmlToolAdapter(ToolAdapter):
                         params, ensure_ascii=False,
                     ),
                 })
+
+        if blocks and not calls:
+            logger.warning(
+                "Detected <minimax:tool_call> tag but extracted "
+                "0 calls: %.300s", raw_content,
+            )
 
         clean_text = _MINIMAX_TC_RE.sub("", raw_content).strip()
         return clean_text, calls
