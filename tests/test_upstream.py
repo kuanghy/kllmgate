@@ -6,7 +6,9 @@ import httpx
 import pytest
 
 from kllmgate.models import ProviderConfig
-from kllmgate.upstream.client import UpstreamClient
+from kllmgate.upstream.client import (
+    UpstreamClient, _parse_retry_after,
+)
 from kllmgate.errors import UpstreamError, UpstreamHTTPError
 
 
@@ -147,13 +149,63 @@ class TestUpstreamClientSend:
         cfg = _make_config(max_retries=1)
         client = UpstreamClient(cfg)
 
-        httpx_mock.add_response(status_code=429, text="rate limited")
+        httpx_mock.add_response(status_code=500, text="server error")
         httpx_mock.add_response(
             json={"id": "chatcmpl-2", "choices": []},
         )
 
         result = await client.send({"model": "test"})
         assert result["id"] == "chatcmpl-2"
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_send_429_with_retry_after_retries(self, httpx_mock):
+        """429 + Retry-After < 60s → 等待后重试"""
+        cfg = _make_config(max_retries=1)
+        client = UpstreamClient(cfg)
+
+        httpx_mock.add_response(
+            status_code=429, text="rate limited",
+            headers={"retry-after": "1"},
+        )
+        httpx_mock.add_response(
+            json={"id": "chatcmpl-ok", "choices": []},
+        )
+
+        result = await client.send({"model": "test"})
+        assert result["id"] == "chatcmpl-ok"
+        assert len(httpx_mock.get_requests()) == 2
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_send_429_without_retry_after_not_retried(self, httpx_mock):
+        """429 无 Retry-After → 直接返回错误"""
+        cfg = _make_config(max_retries=3)
+        client = UpstreamClient(cfg)
+
+        httpx_mock.add_response(status_code=429, text="rate limited")
+
+        with pytest.raises(UpstreamHTTPError) as exc_info:
+            await client.send({"model": "test"})
+        assert exc_info.value.upstream_status == 429
+        assert len(httpx_mock.get_requests()) == 1
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_send_429_retry_after_too_large_not_retried(self, httpx_mock):
+        """429 + Retry-After >= 60s → 直接返回错误"""
+        cfg = _make_config(max_retries=3)
+        client = UpstreamClient(cfg)
+
+        httpx_mock.add_response(
+            status_code=429, text="rate limited",
+            headers={"retry-after": "120"},
+        )
+
+        with pytest.raises(UpstreamHTTPError) as exc_info:
+            await client.send({"model": "test"})
+        assert exc_info.value.upstream_status == 429
+        assert len(httpx_mock.get_requests()) == 1
         await client.close()
 
     @pytest.mark.asyncio
@@ -230,3 +282,71 @@ class TestUpstreamClientStream:
         assert len(events) == 2
         assert events[-1].data == "[DONE]"
         await client.close()
+
+    @pytest.mark.asyncio
+    async def test_send_stream_429_with_retry_after_retries(self, httpx_mock):
+        cfg = _make_config(max_retries=1)
+        client = UpstreamClient(cfg)
+
+        sse_body = (
+            'data: {"choices": [{"delta": {"content": "ok"}}]}\n\n'
+            "data: [DONE]\n\n"
+        )
+        httpx_mock.add_response(
+            status_code=429, text="rate limited",
+            headers={"retry-after": "0"},
+        )
+        httpx_mock.add_response(
+            text=sse_body,
+            headers={"content-type": "text/event-stream"},
+        )
+
+        events = []
+        async for ev in client.send_stream(
+            {"model": "test", "stream": True},
+        ):
+            events.append(ev)
+
+        assert len(events) == 2
+        assert len(httpx_mock.get_requests()) == 2
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_send_stream_429_without_retry_after_not_retried(
+        self, httpx_mock,
+    ):
+        cfg = _make_config(max_retries=3)
+        client = UpstreamClient(cfg)
+
+        httpx_mock.add_response(status_code=429, text="quota exceeded")
+
+        with pytest.raises(UpstreamHTTPError) as exc_info:
+            async for _ in client.send_stream({"model": "test"}):
+                pass
+        assert exc_info.value.upstream_status == 429
+        assert len(httpx_mock.get_requests()) == 1
+        await client.close()
+
+
+class TestParseRetryAfter:
+
+    def test_integer_seconds(self):
+        assert _parse_retry_after("30") == 30.0
+
+    def test_float_seconds(self):
+        assert _parse_retry_after("0.5") == 0.5
+
+    def test_zero(self):
+        assert _parse_retry_after("0") == 0.0
+
+    def test_none_returns_none(self):
+        assert _parse_retry_after(None) is None
+
+    def test_empty_string_returns_none(self):
+        assert _parse_retry_after("") is None
+
+    def test_invalid_string_returns_none(self):
+        assert _parse_retry_after("not-a-number") is None
+
+    def test_negative_returns_none(self):
+        assert _parse_retry_after("-1") is None

@@ -14,8 +14,8 @@ from ..sse import SseEvent, parse_sse_events
 
 logger = logging.getLogger(__name__)
 
-_RETRYABLE_STATUS_CODES = {429, 500, 502, 503}
-_NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404}
+_RETRYABLE_STATUS_CODES = {500, 502, 503}
+_MAX_429_RETRY_AFTER = 60
 
 _FORWARD_UPSTREAM_HEADERS = frozenset({
     "retry-after",
@@ -28,6 +28,27 @@ _FORWARD_UPSTREAM_HEADERS = frozenset({
     "x-ratelimit-reset-requests",
     "x-ratelimit-reset-tokens",
 })
+
+_ERROR_LOG_HEADERS = (
+    "x-request-id",
+    "request-id",
+    "cf-ray",
+    "openai-processing-ms",
+)
+
+_RATELIMIT_LOG_HEADERS = (
+    "retry-after",
+    "x-ratelimit-limit-requests",
+    "x-ratelimit-limit-tokens",
+    "x-ratelimit-remaining-requests",
+    "x-ratelimit-remaining-tokens",
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-reset-tokens",
+    "anthropic-ratelimit-requests-remaining",
+    "anthropic-ratelimit-tokens-remaining",
+    "anthropic-ratelimit-requests-reset",
+    "anthropic-ratelimit-tokens-reset",
+)
 
 _ENDPOINT_MAP = {
     ("openai", "chat"): "/chat/completions",
@@ -43,6 +64,34 @@ def _collect_forward_headers(
         k: v for k, v in resp.headers.items()
         if k.lower() in _FORWARD_UPSTREAM_HEADERS
     }
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """解析 Retry-After 头，返回等待秒数，无效值返回 None"""
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+        return seconds if seconds >= 0 else None
+    except ValueError:
+        return None
+
+
+def _log_error_headers(resp: httpx.Response) -> None:
+    """记录有助于问题定位的上游响应头"""
+    names = _ERROR_LOG_HEADERS
+    if resp.status_code == 429:
+        names = names + _RATELIMIT_LOG_HEADERS
+    parts = [
+        f"{name}={resp.headers[name]}"
+        for name in names
+        if name in resp.headers
+    ]
+    if parts:
+        logger.warning(
+            "Upstream HTTP %d response headers: %s",
+            resp.status_code, ", ".join(parts),
+        )
 
 
 class UpstreamClient:
@@ -117,12 +166,36 @@ class UpstreamClient:
                     )
                     await asyncio.sleep(wait)
                     continue
+                _log_error_headers(resp)
+                raise UpstreamHTTPError(
+                    resp.status_code, resp.text,
+                    _collect_forward_headers(resp),
+                )
+
+            if resp.status_code == 429:
+                retry_after = _parse_retry_after(
+                    resp.headers.get("retry-after"),
+                )
+                if (retry_after is not None
+                        and retry_after < _MAX_429_RETRY_AFTER
+                        and attempt < self.config.max_retries):
+                    logger.warning(
+                        "HTTP 429 with Retry-After: %.1fs "
+                        "(attempt %d/%d), retrying",
+                        retry_after,
+                        attempt + 1,
+                        self.config.max_retries + 1,
+                    )
+                    await asyncio.sleep(retry_after)
+                    continue
+                _log_error_headers(resp)
                 raise UpstreamHTTPError(
                     resp.status_code, resp.text,
                     _collect_forward_headers(resp),
                 )
 
             if resp.status_code >= 400:
+                _log_error_headers(resp)
                 raise UpstreamHTTPError(
                     resp.status_code, resp.text,
                     _collect_forward_headers(resp),
@@ -168,6 +241,33 @@ class UpstreamClient:
                         await resp.aclose()
                         await asyncio.sleep(wait)
                         continue
+                    _log_error_headers(resp)
+                    raise UpstreamHTTPError(
+                        resp.status_code, body_text,
+                        _collect_forward_headers(resp),
+                    )
+
+                if resp.status_code == 429:
+                    body_text = (await resp.aread()).decode(
+                        errors="replace",
+                    )
+                    retry_after = _parse_retry_after(
+                        resp.headers.get("retry-after"),
+                    )
+                    if (retry_after is not None
+                            and retry_after < _MAX_429_RETRY_AFTER
+                            and attempt < self.config.max_retries):
+                        logger.warning(
+                            "Stream HTTP 429 with Retry-After: "
+                            "%.1fs (attempt %d/%d), retrying",
+                            retry_after,
+                            attempt + 1,
+                            self.config.max_retries + 1,
+                        )
+                        await resp.aclose()
+                        await asyncio.sleep(retry_after)
+                        continue
+                    _log_error_headers(resp)
                     raise UpstreamHTTPError(
                         resp.status_code, body_text,
                         _collect_forward_headers(resp),
@@ -177,6 +277,7 @@ class UpstreamClient:
                     body_text = (await resp.aread()).decode(
                         errors="replace",
                     )
+                    _log_error_headers(resp)
                     raise UpstreamHTTPError(
                         resp.status_code, body_text,
                         _collect_forward_headers(resp),
