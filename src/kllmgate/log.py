@@ -8,14 +8,14 @@ UVICORN_LOG_CONFIG: dict = {
     "formatters": {
         "default": {
             "()": "uvicorn.logging.DefaultFormatter",
-            "fmt": "%(asctime)s %(levelname)s [%(name)s] %(message)s",
+            "fmt": "%(asctime)s %(levelname)s [uvicorn] %(message)s",
             "datefmt": "%Y-%m-%d %H:%M:%S",
             "use_colors": None,
         },
         "access": {
             "()": "uvicorn.logging.AccessFormatter",
             "fmt": (
-                '%(asctime)s %(levelname)s [%(name)s]'
+                '%(asctime)s %(levelname)s [uvicorn]'
                 ' %(client_addr)s - "%(request_line)s" %(status_code)s'
             ),
             "datefmt": "%Y-%m-%d %H:%M:%S",
