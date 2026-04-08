@@ -322,7 +322,16 @@ async def _logged_stream(
     except Exception as e:
         status = "error"
         error_type_val = getattr(e, "error_type", "server_error")
-        logger.error("Stream error: %s", e, exc_info=True)
+        if isinstance(e, UpstreamHTTPError):
+            logger.warning(
+                "%s: %s | upstream_body=%s",
+                type(e).__name__, e.message,
+                text_shorten(e.upstream_body, 200) if e.upstream_body else "",
+            )
+        elif isinstance(e, (UpstreamError, ConversionError)):
+            logger.warning("%s: %s", type(e).__name__, e.message)
+        else:
+            logger.error("Stream error: %s", e, exc_info=True)
         for event_text in _make_stream_error_events(
             inbound_format, str(e),
         ):
