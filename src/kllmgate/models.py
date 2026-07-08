@@ -19,6 +19,7 @@ class ServerConfig:
     port: int = 8500
     log_level: str = "info"
     default_provider: str | None = None
+    models_list: list[str] | None = None
 
 
 @dataclass

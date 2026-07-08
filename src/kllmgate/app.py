@@ -10,6 +10,7 @@ from fastapi import FastAPI, Request, Response
 
 from .errors import GatewayError, ProtocolError, format_error_response
 from .models import GatewayConfig, ProtocolFormat
+from .models_catalog import anthropic_models_payload, openai_models_payload
 from .pipeline import PROVIDER_HEADER, process_request
 from .upstream.client import UpstreamClient
 
@@ -42,6 +43,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
         app.state.upstream_clients = clients
         app.state.model_aliases = config.model_aliases
         app.state.default_provider = config.default_provider
+        app.state.models_list = config.server.models_list
         if config.model_aliases:
             logger.info("Loaded %d model alias(es)", len(config.model_aliases))
         if config.default_provider:
@@ -98,6 +100,16 @@ def create_app(config: GatewayConfig) -> FastAPI:
                 e, ProtocolFormat.OPENAI_RESPONSES,
             )
 
+    @app.get("/openai/models")
+    @app.get("/openai/v1/models")
+    async def openai_models(request: Request):
+        """OpenAI 兼容模型列表，供 Codex 等客户端健康探测"""
+        return openai_models_payload(
+            request.app.state.providers,
+            request.app.state.model_aliases,
+            models_list=request.app.state.models_list,
+        )
+
     @app.post("/anthropic/v1/messages")
     async def anthropic_messages(request: Request):
         try:
@@ -119,6 +131,15 @@ def create_app(config: GatewayConfig) -> FastAPI:
             return format_error_response(
                 e, ProtocolFormat.ANTHROPIC_MESSAGES,
             )
+
+    @app.get("/anthropic/v1/models")
+    async def anthropic_models(request: Request):
+        """Anthropic 兼容模型列表"""
+        return anthropic_models_payload(
+            request.app.state.providers,
+            request.app.state.model_aliases,
+            models_list=request.app.state.models_list,
+        )
 
     @app.api_route(
         "/{prefix}",

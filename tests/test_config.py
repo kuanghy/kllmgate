@@ -294,6 +294,20 @@ class TestLoadConfigValidation:
         with pytest.raises(ConfigError, match="nonexistent"):
             load_config(path)
 
+    def test_model_aliases_target_not_in_whitelist_raises(self, toml_file):
+        path = toml_file("""\
+            [providers.test]
+            base_url = "https://api.example.com"
+            api_key = "sk-test"
+            protocol = "openai"
+            models = ["gpt-4.1"]
+
+            [model_aliases]
+            "gpt-4" = "test/gpt-4o"
+        """)
+        with pytest.raises(ConfigError, match="models whitelist"):
+            load_config(path)
+
 
 class TestServerConfig:
 
@@ -417,4 +431,80 @@ class TestDefaultProvider:
             protocol = "openai"
         """)
         with pytest.raises(ConfigError, match="nonexistent"):
+            load_config(path)
+
+
+class TestModelsList:
+
+    def test_models_list_parsed(self, toml_file):
+        path = toml_file("""\
+            [server]
+            models_list = ["MiniMax-M2.5", "test/gpt-4.1"]
+
+            [providers.test]
+            base_url = "https://api.example.com"
+            api_key = "sk-test"
+            protocol = "openai"
+            models = ["gpt-4.1"]
+
+            [model_aliases]
+            "MiniMax-M2.5" = "test/gpt-4.1"
+        """)
+        config = load_config(path)
+        assert config.server.models_list == [
+            "MiniMax-M2.5", "test/gpt-4.1",
+        ]
+
+    def test_models_list_none_when_omitted(self, toml_file):
+        path = toml_file("""\
+            [providers.test]
+            base_url = "https://api.example.com"
+            api_key = "sk-test"
+            protocol = "openai"
+        """)
+        config = load_config(path)
+        assert config.server.models_list is None
+
+    def test_models_list_unknown_entry_raises(self, toml_file):
+        path = toml_file("""\
+            [server]
+            models_list = ["unknown-model"]
+
+            [providers.test]
+            base_url = "https://api.example.com"
+            api_key = "sk-test"
+            protocol = "openai"
+            models = ["gpt-4.1"]
+        """)
+        with pytest.raises(ConfigError, match="unknown-model"):
+            load_config(path)
+
+    def test_models_list_accepts_anthropic_models(self, toml_file):
+        path = toml_file("""\
+            [server]
+            models_list = ["test_anthropic/claude-sonnet-4-20250514"]
+
+            [providers.test_anthropic]
+            base_url = "https://api.anthropic.com"
+            api_key = "sk-ant-test"
+            protocol = "anthropic"
+            models = ["claude-sonnet-4-20250514"]
+        """)
+        config = load_config(path)
+        assert config.server.models_list == [
+            "test_anthropic/claude-sonnet-4-20250514",
+        ]
+
+    def test_models_list_non_string_entry_raises(self, toml_file):
+        path = toml_file("""\
+            [server]
+            models_list = [1]
+
+            [providers.test]
+            base_url = "https://api.example.com"
+            api_key = "sk-test"
+            protocol = "openai"
+            models = ["gpt-4.1"]
+        """)
+        with pytest.raises(ConfigError, match="must be a string"):
             load_config(path)

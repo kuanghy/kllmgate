@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .errors import ConfigError
 from .models import GatewayConfig, ProviderConfig, ServerConfig
+from .models_catalog import collect_available_model_ids
 
 _SEARCH_PATHS = [
     Path("/etc/kllmgate/config.toml"),
@@ -83,6 +84,7 @@ def load_config(path: str) -> GatewayConfig:
 
     model_aliases = _parse_model_aliases(raw, providers)
     _validate_default_provider(server, providers)
+    _validate_models_list(server, providers, model_aliases)
 
     return GatewayConfig(
         server=server,
@@ -112,6 +114,7 @@ def _parse_server(raw: dict) -> ServerConfig:
         port=port,
         log_level=log_level,
         default_provider=section.get("default_provider"),
+        models_list=section.get("models_list"),
     )
 
 
@@ -129,6 +132,34 @@ def _validate_default_provider(
             f"not found in providers",
             code="unknown_default_provider",
         )
+
+
+def _validate_models_list(
+    server: ServerConfig,
+    providers: dict[str, ProviderConfig],
+    model_aliases: dict[str, str],
+) -> None:
+    """校验 models_list 条目均存在于可暴露模型集合"""
+    if server.models_list is None:
+        return
+    if not isinstance(server.models_list, list):
+        raise ConfigError(
+            "server: models_list must be a list of model IDs",
+            code="invalid_models_list",
+        )
+    available = collect_available_model_ids(providers, model_aliases)
+    for model_id in server.models_list:
+        if not isinstance(model_id, str):
+            raise ConfigError(
+                f"server: models_list entry {model_id!r} must be a string",
+                code="invalid_models_list_entry",
+            )
+        if model_id not in available:
+            raise ConfigError(
+                f"server: models_list entry {model_id!r} "
+                f"is not an exposed model",
+                code="unknown_models_list_entry",
+            )
 
 
 def _parse_provider(name: str, section: dict) -> ProviderConfig:
@@ -208,6 +239,15 @@ def _parse_model_aliases(
                 f"model_aliases: target provider {provider_name!r} "
                 f"for alias {alias!r} not found in providers",
                 code="alias_unknown_provider",
+            )
+        provider = providers[provider_name]
+        upstream_model = target.split("/", 1)[1]
+        if provider.models and upstream_model not in provider.models:
+            raise ConfigError(
+                f"model_aliases: target model {upstream_model!r} for "
+                f"alias {alias!r} not in provider {provider_name!r} "
+                f"models whitelist",
+                code="alias_model_not_supported",
             )
         aliases[alias] = target
     return aliases

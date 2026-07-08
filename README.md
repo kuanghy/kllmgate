@@ -83,7 +83,12 @@ kllmgate --config config.toml
 
 - `POST /openai/chat/completions`
 - `POST /openai/responses`
+- `GET /openai/models`
+- `GET /openai/v1/models`
 - `POST /anthropic/v1/messages`
+- `GET /anthropic/v1/models`
+
+`GET /openai/models` 与 `GET /anthropic/v1/models` 共用同一候选集（全部 `model_aliases` + 全部 `provider/model`，不区分协议），仅响应格式不同。可选配置 `[server] models_list` 限制两个端点对外展示的模型 ID；详见 `config.example.toml`。
 
 客户端指定模型提供商有四种方式（按优先级从高到低）：
 

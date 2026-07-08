@@ -10,6 +10,7 @@ from starlette.datastructures import Headers
 
 from kllmgate.app import _extract_forward_headers, create_app
 from kllmgate.config import load_config
+from kllmgate.errors import ConfigError
 
 
 @pytest.fixture
@@ -21,11 +22,15 @@ def config_file(tmp_path):
         api_key = "sk-test"
         protocol = "openai"
         wire_api = "chat"
+        models = ["gpt-4.1"]
 
         [providers.test_anthropic]
         base_url = "https://api.anthropic.com"
         api_key = "sk-ant-test"
         protocol = "anthropic"
+
+        [model_aliases]
+        "MiniMax-M2.5" = "test_openai/gpt-4.1"
     """))
     return str(path)
 
@@ -142,6 +147,165 @@ class TestRoutes:
             return
         if resp.status_code == 400:
             assert resp.json()["error"]["code"] != "invalid_model_format"
+
+
+class TestOpenAIModels:
+
+    def test_openai_models_lists_aliases_and_provider_models(self, client):
+        resp = client.get("/openai/models")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["object"] == "list"
+        model_ids = {item["id"] for item in body["data"]}
+        assert "MiniMax-M2.5" in model_ids
+        assert "test_openai/gpt-4.1" in model_ids
+        assert "gpt-4.1" not in model_ids
+
+    def test_openai_v1_models_matches_openai_models(self, client):
+        base = client.get("/openai/models")
+        v1 = client.get("/openai/v1/models")
+        assert base.status_code == 200
+        assert v1.status_code == 200
+        assert base.json() == v1.json()
+
+    def test_openai_models_filters_by_server_list(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(textwrap.dedent("""\
+            [server]
+            models_list = ["MiniMax-M2.5"]
+
+            [providers.test_openai]
+            base_url = "https://api.example.com/v1"
+            api_key = "sk-test"
+            protocol = "openai"
+            wire_api = "chat"
+            models = ["gpt-4.1"]
+
+            [model_aliases]
+            "MiniMax-M2.5" = "test_openai/gpt-4.1"
+        """))
+        with TestClient(create_app(load_config(str(path)))) as c:
+            resp = c.get("/openai/models")
+        assert resp.status_code == 200
+        model_ids = {item["id"] for item in resp.json()["data"]}
+        assert model_ids == {"MiniMax-M2.5"}
+
+
+class TestAnthropicModels:
+
+    def test_anthropic_models_lists_aliases_and_provider_models(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(textwrap.dedent("""\
+            [providers.test_anthropic]
+            base_url = "https://api.anthropic.com"
+            api_key = "sk-ant-test"
+            protocol = "anthropic"
+            models = ["claude-sonnet-4-20250514"]
+
+            [providers.test_openai]
+            base_url = "https://api.example.com/v1"
+            api_key = "sk-test"
+            protocol = "openai"
+            models = ["gpt-4.1"]
+
+            [model_aliases]
+            "Claude-Sonnet" = "test_anthropic/claude-sonnet-4-20250514"
+        """))
+        with TestClient(create_app(load_config(str(path)))) as c:
+            resp = c.get("/anthropic/v1/models")
+        assert resp.status_code == 200
+        body = resp.json()
+        model_ids = {item["id"] for item in body["data"]}
+        assert model_ids == {
+            "Claude-Sonnet",
+            "test_anthropic/claude-sonnet-4-20250514",
+            "test_openai/gpt-4.1",
+        }
+        assert body["has_more"] is False
+        assert body["data"][0]["type"] == "model"
+        assert "capabilities" in body["data"][0]
+
+    def test_models_list_unknown_entry_rejected_at_load(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(textwrap.dedent("""\
+            [server]
+            models_list = ["missing-from-candidates"]
+
+            [providers.test_openai]
+            base_url = "https://api.example.com/v1"
+            api_key = "sk-test"
+            protocol = "openai"
+            models = ["gpt-4.1"]
+        """))
+        with pytest.raises(ConfigError, match="missing-from-candidates"):
+            load_config(str(path))
+
+    def test_empty_models_list_returns_empty_endpoints(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(textwrap.dedent("""\
+            [server]
+            models_list = []
+
+            [providers.test_openai]
+            base_url = "https://api.example.com/v1"
+            api_key = "sk-test"
+            protocol = "openai"
+            models = ["gpt-4.1"]
+        """))
+        with TestClient(create_app(load_config(str(path)))) as c:
+            openai_body = c.get("/openai/models").json()
+            anthropic_body = c.get("/anthropic/v1/models").json()
+        assert openai_body["data"] == []
+        assert anthropic_body["data"] == []
+        assert anthropic_body["has_more"] is False
+
+    def test_openai_and_anthropic_models_share_same_ids(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(textwrap.dedent("""\
+            [providers.test_anthropic]
+            base_url = "https://api.anthropic.com"
+            api_key = "sk-ant-test"
+            protocol = "anthropic"
+            models = ["claude-sonnet-4-20250514"]
+
+            [providers.test_openai]
+            base_url = "https://api.example.com/v1"
+            api_key = "sk-test"
+            protocol = "openai"
+            models = ["gpt-4.1"]
+
+            [model_aliases]
+            "Claude-Sonnet" = "test_anthropic/claude-sonnet-4-20250514"
+        """))
+        with TestClient(create_app(load_config(str(path)))) as c:
+            openai_ids = {
+                item["id"] for item in c.get("/openai/models").json()["data"]
+            }
+            anthropic_ids = {
+                item["id"] for item in c.get("/anthropic/v1/models").json()["data"]
+            }
+        assert openai_ids == anthropic_ids
+
+    def test_anthropic_models_filters_by_server_list(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(textwrap.dedent("""\
+            [server]
+            models_list = ["Claude-Sonnet"]
+
+            [providers.test_anthropic]
+            base_url = "https://api.anthropic.com"
+            api_key = "sk-ant-test"
+            protocol = "anthropic"
+            models = ["claude-sonnet-4-20250514"]
+
+            [model_aliases]
+            "Claude-Sonnet" = "test_anthropic/claude-sonnet-4-20250514"
+        """))
+        with TestClient(create_app(load_config(str(path)))) as c:
+            resp = c.get("/anthropic/v1/models")
+        assert resp.status_code == 200
+        model_ids = {item["id"] for item in resp.json()["data"]}
+        assert model_ids == {"Claude-Sonnet"}
 
 
 class TestHealthCheck:
