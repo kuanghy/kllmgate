@@ -541,3 +541,222 @@ class TestModelsList:
         """)
         with pytest.raises(ConfigError, match="must be a string"):
             load_config(path)
+
+
+class TestAutoProtocolProvider:
+
+    def test_auto_with_openai_and_anthropic_subsections(
+        self, toml_file, monkeypatch,
+    ):
+        monkeypatch.setenv("DUAL_API_KEY", "sk-dual")
+        path = toml_file("""\
+            [providers.dual]
+            protocol = "auto"
+            env_key = "DUAL_API_KEY"
+            timeout_seconds = 90
+            max_retries = 3
+            models = ["model-a"]
+
+            [providers.dual.openai]
+            base_url = "https://openai.example.com/v1"
+            wire_api = "chat"
+            tool_style = "minimax_xml"
+
+            [providers.dual.anthropic]
+            base_url = "https://anthropic.example.com"
+        """)
+        config = load_config(path)
+
+        cfg = config.providers["dual"]
+        assert cfg.protocol == "auto"
+        assert cfg.base_url == ""
+        assert cfg.timeout_seconds == 90
+        assert cfg.max_retries == 3
+        assert cfg.models == ["model-a"]
+        assert cfg.openai is not None
+        assert cfg.openai.base_url == "https://openai.example.com/v1"
+        assert cfg.openai.wire_api == "chat"
+        assert cfg.openai.tool_style == "minimax_xml"
+        assert cfg.anthropic is not None
+        assert cfg.anthropic.base_url == "https://anthropic.example.com"
+        assert cfg.anthropic.wire_api == "messages"
+
+    def test_auto_openai_only_subsection(self, toml_file, monkeypatch):
+        monkeypatch.setenv("ONLY_KEY", "sk-only")
+        path = toml_file("""\
+            [providers.only_openai]
+            protocol = "auto"
+            env_key = "ONLY_KEY"
+
+            [providers.only_openai.openai]
+            base_url = "https://openai.example.com/v1"
+        """)
+        config = load_config(path)
+        cfg = config.providers["only_openai"]
+        assert cfg.openai is not None
+        assert cfg.anthropic is None
+
+    def test_auto_subsection_key_overrides_top_level(
+        self, toml_file, monkeypatch,
+    ):
+        monkeypatch.setenv("TOP_KEY", "sk-top")
+        path = toml_file("""\
+            [providers.dual]
+            protocol = "auto"
+            env_key = "TOP_KEY"
+
+            [providers.dual.openai]
+            base_url = "https://openai.example.com/v1"
+            api_key = "sk-openai"
+
+            [providers.dual.anthropic]
+            base_url = "https://anthropic.example.com"
+        """)
+        config = load_config(path)
+        cfg = config.providers["dual"]
+        assert cfg.openai.api_key == "sk-openai"
+        assert cfg.anthropic.env_key is None
+
+    def test_auto_models_subsection_override(self, toml_file, monkeypatch):
+        monkeypatch.setenv("DUAL_KEY", "sk-dual")
+        path = toml_file("""\
+            [providers.dual]
+            protocol = "auto"
+            api_key = "sk-dual"
+            models = ["shared-model"]
+
+            [providers.dual.openai]
+            base_url = "https://openai.example.com/v1"
+            models = ["openai-only"]
+
+            [providers.dual.anthropic]
+            base_url = "https://anthropic.example.com"
+        """)
+        config = load_config(path)
+        cfg = config.providers["dual"]
+        assert cfg.models == ["shared-model"]
+        assert cfg.openai.models == ["openai-only"]
+        assert cfg.anthropic.models is None
+
+    def test_auto_rejects_top_level_base_url(self, toml_file):
+        path = toml_file("""\
+            [providers.dual]
+            protocol = "auto"
+            base_url = "https://should-not.example.com"
+            api_key = "sk-test"
+
+            [providers.dual.openai]
+            base_url = "https://openai.example.com/v1"
+        """)
+        with pytest.raises(ConfigError, match="base_url"):
+            load_config(path)
+
+    def test_auto_rejects_top_level_wire_api(self, toml_file):
+        path = toml_file("""\
+            [providers.dual]
+            protocol = "auto"
+            api_key = "sk-test"
+            wire_api = "chat"
+
+            [providers.dual.openai]
+            base_url = "https://openai.example.com/v1"
+        """)
+        with pytest.raises(ConfigError, match="wire_api"):
+            load_config(path)
+
+    def test_auto_rejects_top_level_tool_style(self, toml_file):
+        path = toml_file("""\
+            [providers.dual]
+            protocol = "auto"
+            api_key = "sk-test"
+            tool_style = "minimax_xml"
+
+            [providers.dual.openai]
+            base_url = "https://openai.example.com/v1"
+        """)
+        with pytest.raises(ConfigError, match="tool_style"):
+            load_config(path)
+
+    def test_auto_rejects_top_level_thinking_style(self, toml_file):
+        path = toml_file("""\
+            [providers.dual]
+            protocol = "auto"
+            api_key = "sk-test"
+            thinking_style = "think"
+
+            [providers.dual.openai]
+            base_url = "https://openai.example.com/v1"
+        """)
+        with pytest.raises(ConfigError, match="thinking_style"):
+            load_config(path)
+
+    def test_auto_requires_at_least_one_subsection(self, toml_file):
+        path = toml_file("""\
+            [providers.dual]
+            protocol = "auto"
+            api_key = "sk-test"
+        """)
+        with pytest.raises(ConfigError, match="openai|anthropic"):
+            load_config(path)
+
+    def test_auto_subsection_missing_base_url_raises(self, toml_file):
+        path = toml_file("""\
+            [providers.dual]
+            protocol = "auto"
+            api_key = "sk-test"
+
+            [providers.dual.openai]
+            wire_api = "chat"
+        """)
+        with pytest.raises(ConfigError, match="base_url"):
+            load_config(path)
+
+    def test_auto_requires_key_from_top_or_subsection(self, toml_file):
+        path = toml_file("""\
+            [providers.dual]
+            protocol = "auto"
+
+            [providers.dual.openai]
+            base_url = "https://openai.example.com/v1"
+        """)
+        with pytest.raises(ConfigError, match="API key"):
+            load_config(path)
+
+    def test_auto_rejects_anthropic_tool_style(self, toml_file):
+        path = toml_file("""\
+            [providers.dual]
+            protocol = "auto"
+            api_key = "sk-test"
+
+            [providers.dual.anthropic]
+            base_url = "https://anthropic.example.com"
+            tool_style = "minimax_xml"
+        """)
+        with pytest.raises(ConfigError, match="tool_style"):
+            load_config(path)
+
+    def test_auto_rejects_subsection_timeout(self, toml_file):
+        path = toml_file("""\
+            [providers.dual]
+            protocol = "auto"
+            api_key = "sk-test"
+
+            [providers.dual.openai]
+            base_url = "https://openai.example.com/v1"
+            timeout_seconds = 30
+        """)
+        with pytest.raises(ConfigError, match="unknown field"):
+            load_config(path)
+
+    def test_auto_rejects_unknown_subsection_field(self, toml_file):
+        path = toml_file("""\
+            [providers.dual]
+            protocol = "auto"
+            api_key = "sk-test"
+
+            [providers.dual.openai]
+            base_url = "https://openai.example.com/v1"
+            protocol = "openai"
+        """)
+        with pytest.raises(ConfigError, match="unknown field"):
+            load_config(path)

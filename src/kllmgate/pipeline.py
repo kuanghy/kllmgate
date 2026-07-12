@@ -45,7 +45,7 @@ from .errors import (
     ConfigError, ConversionError, GatewayError, InternalError,
     UpstreamError, UpstreamHTTPError,
 )
-from .models import ProtocolFormat, ProviderConfig
+from .models import ProtocolFormat, ProviderConfig, ResolvedUpstream
 from .sse import SseEvent, format_data_only_sse, format_named_sse
 from .thinking import (
     ThinkingExtractor, NullThinkingExtractor,
@@ -100,8 +100,10 @@ CONVERTER_REGISTRY: dict[
 }
 
 
-def get_thinking_extractor(provider: ProviderConfig) -> ThinkingExtractor:
-    match provider.thinking_style:
+def get_thinking_extractor(
+    source: ProviderConfig | ResolvedUpstream,
+) -> ThinkingExtractor:
+    match source.thinking_style:
         case "disabled":
             return NullThinkingExtractor()
         case "think":
@@ -111,17 +113,22 @@ def get_thinking_extractor(provider: ProviderConfig) -> ThinkingExtractor:
         case "lvl_entry":
             return LvlEntryThinkingExtractor()
         case _:
+            name = getattr(source, "name", None) or getattr(
+                source, "provider_name", "unknown",
+            )
             raise ConfigError(
-                f"unknown thinking_style for provider {provider.name!r}: "
-                f"{provider.thinking_style!r}",
+                f"unknown thinking_style for provider {name!r}: "
+                f"{source.thinking_style!r}",
                 code="invalid_thinking_style",
             )
 
 
-def get_tool_adapter(provider: ProviderConfig) -> ToolAdapter:
-    if provider.protocol == "anthropic":
+def get_tool_adapter(
+    source: ProviderConfig | ResolvedUpstream,
+) -> ToolAdapter:
+    if source.protocol == "anthropic":
         return AnthropicToolAdapter()
-    match provider.tool_style:
+    match source.tool_style:
         case "minimax_xml":
             return MinimaxXmlToolAdapter()
         case "deepseek":
@@ -133,9 +140,12 @@ def get_tool_adapter(provider: ProviderConfig) -> ToolAdapter:
         case "standard":
             return StandardToolAdapter()
         case _:
+            name = getattr(source, "name", None) or getattr(
+                source, "provider_name", "unknown",
+            )
             raise ConfigError(
-                f"unknown tool_style for provider {provider.name!r}: "
-                f"{provider.tool_style!r}",
+                f"unknown tool_style for provider {name!r}: "
+                f"{source.tool_style!r}",
                 code="invalid_tool_style",
             )
 
@@ -146,9 +156,14 @@ def get_converter(
     tool_adapter: ToolAdapter,
     thinking_extractor: ThinkingExtractor | None = None,
 ) -> Converter:
+    same_format = inbound_format == upstream_format
+    passthrough_tools = isinstance(tool_adapter, StandardToolAdapter) or (
+        inbound_format == PF.ANTHROPIC_MESSAGES
+        and isinstance(tool_adapter, AnthropicToolAdapter)
+    )
     if (
-        inbound_format == upstream_format
-        and isinstance(tool_adapter, StandardToolAdapter)
+        same_format
+        and passthrough_tools
         and isinstance(
             thinking_extractor, (NullThinkingExtractor, type(None)),
         )
@@ -461,17 +476,21 @@ async def process_request(
                 code="unknown_provider",
             )
         provider = providers[provider_name]
+        resolved = provider.resolve_for_inbound(inbound_format)
 
-        if provider.models and upstream_model not in provider.models:
+        if (
+            resolved.models is not None
+            and upstream_model not in resolved.models
+        ):
             raise ConfigError(
                 f"model {upstream_model!r} not supported by "
                 f"provider {provider_name!r}",
                 code="model_not_supported",
             )
 
-        upstream_format = provider.protocol_format
-        tool_adapter = get_tool_adapter(provider)
-        thinking_extractor = get_thinking_extractor(provider)
+        upstream_format = resolved.protocol_format
+        tool_adapter = get_tool_adapter(resolved)
+        thinking_extractor = get_thinking_extractor(resolved)
         converter = get_converter(
             inbound_format, upstream_format,
             tool_adapter, thinking_extractor,
@@ -482,9 +501,9 @@ async def process_request(
         upstream_body = converter.convert_request(body, upstream_model)
         logger.debug(
             "Upstream request: request_id=%s provider=%s model=%s "
-            "converter=%s",
+            "converter=%s upstream=%s",
             request_id, provider_name, upstream_model,
-            type(converter).__name__,
+            type(converter).__name__, upstream_format.value,
         )
 
         client = upstream_clients.get(provider_name)
@@ -498,7 +517,9 @@ async def process_request(
         if is_stream:
             stream_usage: dict = {}
             upstream_events = client.send_stream(
-                upstream_body, extra_headers=forward_headers,
+                upstream_body,
+                extra_headers=forward_headers,
+                target=resolved,
             )
             try:
                 first_event = await anext(upstream_events)
@@ -530,7 +551,9 @@ async def process_request(
             )
 
         upstream_response = await client.send(
-            upstream_body, extra_headers=forward_headers,
+            upstream_body,
+            extra_headers=forward_headers,
+            target=resolved,
         )
         converted = converter.convert_response(upstream_response)
         _log_request(

@@ -7,7 +7,12 @@ import tomllib
 from pathlib import Path
 
 from .errors import ConfigError
-from .models import GatewayConfig, ProviderConfig, ServerConfig
+from .models import (
+    GatewayConfig,
+    ProtocolEndpointConfig,
+    ProviderConfig,
+    ServerConfig,
+)
 from .models_catalog import collect_available_model_ids
 
 _SEARCH_PATHS = [
@@ -46,12 +51,22 @@ def resolve_config(cli_arg: str | None) -> str:
     return found or "config.toml"
 
 
-_VALID_PROTOCOLS = {"openai", "anthropic"}
+_VALID_PROTOCOLS = {"openai", "anthropic", "auto"}
 _VALID_WIRE_APIS = {"chat", "responses", "messages"}
 _VALID_THINKING_STYLES = {
     "disabled", "think", "thinking_token", "lvl_entry",
 }
 _VALID_LOG_LEVELS = {"debug", "info", "warning", "error"}
+_AUTO_FORBIDDEN_TOP_FIELDS = (
+    "base_url", "wire_api", "tool_style", "thinking_style",
+)
+_OPENAI_ENDPOINT_FIELDS = frozenset({
+    "base_url", "api_key", "env_key", "wire_api",
+    "tool_style", "thinking_style", "models",
+})
+_ANTHROPIC_ENDPOINT_FIELDS = frozenset({
+    "base_url", "api_key", "env_key", "wire_api", "models",
+})
 
 
 def load_config(path: str) -> GatewayConfig:
@@ -166,11 +181,6 @@ def _validate_models_list(
 
 
 def _parse_provider(name: str, section: dict) -> ProviderConfig:
-    if "base_url" not in section:
-        raise ConfigError(
-            f"provider {name!r}: missing required field 'base_url'",
-            code="missing_required_field",
-        )
     if "protocol" not in section:
         raise ConfigError(
             f"provider {name!r}: missing required field 'protocol'",
@@ -183,6 +193,15 @@ def _parse_provider(name: str, section: dict) -> ProviderConfig:
             f"provider {name!r}: invalid protocol {protocol!r}, "
             f"must be one of {_VALID_PROTOCOLS}",
             code="invalid_protocol",
+        )
+
+    if protocol == "auto":
+        return _parse_auto_provider(name, section)
+
+    if "base_url" not in section:
+        raise ConfigError(
+            f"provider {name!r}: missing required field 'base_url'",
+            code="missing_required_field",
         )
 
     wire_api = section.get("wire_api")
@@ -228,8 +247,128 @@ def _parse_provider(name: str, section: dict) -> ProviderConfig:
         strip_system_prompt=section.get("strip_system_prompt", False),
     )
     # 启动阶段提前验证 API key，避免服务在不可用配置下成功启动
-    provider.resolve_api_key()
+    provider.validate_api_keys()
     return provider
+
+
+def _parse_auto_provider(name: str, section: dict) -> ProviderConfig:
+    for field_name in _AUTO_FORBIDDEN_TOP_FIELDS:
+        if field_name in section:
+            raise ConfigError(
+                f"provider {name!r}: protocol=auto must not set "
+                f"top-level {field_name!r}; configure it under "
+                f"[providers.{name}.openai] or "
+                f"[providers.{name}.anthropic]",
+                code="invalid_auto_provider_field",
+            )
+
+    openai_raw = section.get("openai")
+    anthropic_raw = section.get("anthropic")
+    if openai_raw is not None and not isinstance(openai_raw, dict):
+        raise ConfigError(
+            f"provider {name!r}: openai subsection must be a table",
+            code="invalid_auto_subsection_type",
+        )
+    if anthropic_raw is not None and not isinstance(anthropic_raw, dict):
+        raise ConfigError(
+            f"provider {name!r}: anthropic subsection must be a table",
+            code="invalid_auto_subsection_type",
+        )
+
+    if openai_raw is None and anthropic_raw is None:
+        raise ConfigError(
+            f"provider {name!r}: protocol=auto requires at least one "
+            f"of [providers.{name}.openai] or "
+            f"[providers.{name}.anthropic]",
+            code="missing_auto_subsection",
+        )
+
+    openai_ep = (
+        _parse_protocol_endpoint(name, "openai", openai_raw)
+        if openai_raw is not None else None
+    )
+    anthropic_ep = (
+        _parse_protocol_endpoint(name, "anthropic", anthropic_raw)
+        if anthropic_raw is not None else None
+    )
+
+    provider = ProviderConfig(
+        name=name,
+        base_url="",
+        api_key=section.get("api_key"),
+        env_key=section.get("env_key"),
+        protocol="auto",
+        timeout_seconds=section.get("timeout_seconds", 120),
+        max_retries=section.get("max_retries", 2),
+        models=section.get("models"),
+        strip_system_prompt=section.get("strip_system_prompt", False),
+        openai=openai_ep,
+        anthropic=anthropic_ep,
+    )
+    provider.validate_api_keys()
+    return provider
+
+
+def _parse_protocol_endpoint(
+    provider_name: str,
+    protocol: str,
+    section: dict,
+) -> ProtocolEndpointConfig:
+    label = f"provider {provider_name!r}.{protocol}"
+    allowed = (
+        _OPENAI_ENDPOINT_FIELDS
+        if protocol == "openai"
+        else _ANTHROPIC_ENDPOINT_FIELDS
+    )
+    unknown = sorted(set(section) - allowed)
+    if unknown:
+        raise ConfigError(
+            f"{label}: unknown field {unknown[0]!r}",
+            code="invalid_auto_provider_field",
+        )
+
+    if "base_url" not in section:
+        raise ConfigError(
+            f"{label}: missing required field 'base_url'",
+            code="missing_required_field",
+        )
+
+    wire_api = section.get("wire_api")
+    if protocol == "anthropic":
+        if wire_api and wire_api != "messages":
+            raise ConfigError(
+                f"{label}: anthropic does not support "
+                f"wire_api={wire_api!r}, must be 'messages' or omitted",
+                code="invalid_wire_api",
+            )
+        wire_api = wire_api or "messages"
+    else:
+        if wire_api is None:
+            wire_api = "chat"
+        elif wire_api not in ("chat", "responses"):
+            raise ConfigError(
+                f"{label}: invalid wire_api {wire_api!r}, "
+                f"must be 'chat' or 'responses'",
+                code="invalid_wire_api",
+            )
+
+    thinking_style = section.get("thinking_style", "disabled")
+    if thinking_style not in _VALID_THINKING_STYLES:
+        raise ConfigError(
+            f"{label}: invalid thinking_style {thinking_style!r}, "
+            f"must be one of {sorted(_VALID_THINKING_STYLES)}",
+            code="invalid_thinking_style",
+        )
+
+    return ProtocolEndpointConfig(
+        base_url=section["base_url"].rstrip("/"),
+        api_key=section.get("api_key"),
+        env_key=section.get("env_key"),
+        wire_api=wire_api,
+        tool_style=section.get("tool_style", "standard"),
+        thinking_style=thinking_style,
+        models=section.get("models"),
+    )
 
 
 def _parse_model_aliases(
@@ -255,7 +394,7 @@ def _parse_model_aliases(
             )
         provider = providers[provider_name]
         upstream_model = target.split("/", 1)[1]
-        if provider.models and upstream_model not in provider.models:
+        if not provider.allows_model_for_alias(upstream_model):
             raise ConfigError(
                 f"model_aliases: target model {upstream_model!r} for "
                 f"alias {alias!r} not in provider {provider_name!r} "

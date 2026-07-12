@@ -80,8 +80,10 @@ class TestGetConverter:
         conv = get_converter(PF.OPENAI_RESPONSES, PF.OPENAI_CHAT, adapter)
         assert isinstance(conv, OpenaiResponsesToOpenaiChatConverter)
 
-    def test_anthropic_same_protocol_standard_is_passthrough(self):
-        adapter = StandardToolAdapter()
+    def test_anthropic_same_protocol_with_anthropic_adapter_is_passthrough(
+        self,
+    ):
+        adapter = AnthropicToolAdapter()
         conv = get_converter(
             PF.ANTHROPIC_MESSAGES, PF.ANTHROPIC_MESSAGES, adapter,
         )
@@ -237,7 +239,7 @@ class TestProcessRequest:
 
         providers = {"test": _cfg()}
 
-        async def _fake_stream(body, extra_headers=None):
+        async def _fake_stream(body, extra_headers=None, target=None):
             return
             yield
 
@@ -262,13 +264,15 @@ class TestProcessRequest:
 
         providers = {"test": _cfg()}
 
-        async def _failing_stream(body, extra_headers=None):
+        async def _failing_stream(body, extra_headers=None, target=None):
             raise UpstreamHTTPError(401, "Unauthorized")
             yield
 
         class _Client:
-            def send_stream(self, body, extra_headers=None):
-                return _failing_stream(body, extra_headers=extra_headers)
+            def send_stream(self, body, extra_headers=None, target=None):
+                return _failing_stream(
+                    body, extra_headers=extra_headers, target=target,
+                )
 
         with pytest.raises(UpstreamHTTPError):
             await process_request(
@@ -416,7 +420,7 @@ class TestProcessRequest:
         providers = {"test": _cfg()}
 
         class _BoomClient:
-            async def send(self, body, extra_headers=None):
+            async def send(self, body, extra_headers=None, target=None):
                 raise RuntimeError("simulated bug with secret path")
 
         with pytest.raises(InternalError) as exc_info:
@@ -594,3 +598,313 @@ class TestLoggedStreamDisconnect:
         full = "".join(out)
         assert "malformed tool call xml" in full
         assert "internal server error" not in full
+
+
+class TestAutoProtocolProcessRequest:
+
+    def _dual_cfg(self, **overrides):
+        from kllmgate.models import ProtocolEndpointConfig
+
+        defaults = {
+            "name": "dual",
+            "protocol": "auto",
+            "api_key": "sk-top",
+            "openai": ProtocolEndpointConfig(
+                base_url="https://openai.example.com/v1",
+                wire_api="chat",
+            ),
+            "anthropic": ProtocolEndpointConfig(
+                base_url="https://anthropic.example.com",
+                wire_api="messages",
+            ),
+        }
+        defaults.update(overrides)
+        return ProviderConfig(**defaults)
+
+    @pytest.mark.asyncio
+    async def test_openai_inbound_posts_to_openai_url(self, httpx_mock):
+        from kllmgate.upstream.client import UpstreamClient
+
+        provider = self._dual_cfg()
+        client = UpstreamClient(provider)
+        httpx_mock.add_response(json={
+            "id": "chatcmpl-1",
+            "choices": [{
+                "message": {"content": "hi"},
+                "finish_reason": "stop",
+            }],
+            "usage": {},
+        })
+
+        await process_request(
+            PF.OPENAI_CHAT,
+            {"model": "dual/m1", "messages": [
+                {"role": "user", "content": "hello"},
+            ]},
+            {"dual": provider},
+            {"dual": client},
+        )
+        request = httpx_mock.get_request()
+        assert str(request.url) == (
+            "https://openai.example.com/v1/chat/completions"
+        )
+        assert request.headers["Authorization"] == "Bearer sk-top"
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_openai_stream_posts_to_openai_url(self, httpx_mock):
+        from kllmgate.upstream.client import UpstreamClient
+        from starlette.responses import StreamingResponse
+
+        provider = self._dual_cfg()
+        client = UpstreamClient(provider)
+        sse_body = (
+            'data: {"id":"chatcmpl-1","object":"chat.completion.chunk",'
+            '"choices":[{"index":0,"delta":{"content":"hi"},'
+            '"finish_reason":null}]}\n\n'
+            "data: [DONE]\n\n"
+        )
+        httpx_mock.add_response(
+            text=sse_body,
+            headers={"content-type": "text/event-stream"},
+        )
+
+        resp = await process_request(
+            PF.OPENAI_CHAT,
+            {
+                "model": "dual/m1",
+                "stream": True,
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                ],
+            },
+            {"dual": provider},
+            {"dual": client},
+        )
+        assert isinstance(resp, StreamingResponse)
+        chunks = [chunk async for chunk in resp.body_iterator]
+        assert chunks
+        request = httpx_mock.get_request()
+        assert str(request.url) == (
+            "https://openai.example.com/v1/chat/completions"
+        )
+        assert request.headers["Authorization"] == "Bearer sk-top"
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_anthropic_stream_posts_to_anthropic_url(
+        self, httpx_mock,
+    ):
+        from kllmgate.upstream.client import UpstreamClient
+        from starlette.responses import StreamingResponse
+
+        provider = self._dual_cfg()
+        client = UpstreamClient(provider)
+        sse_body = (
+            "event: message_start\n"
+            'data: {"type":"message_start","message":{"id":"msg_1",'
+            '"type":"message","role":"assistant","content":[],'
+            '"model":"m1","stop_reason":null,"usage":'
+            '{"input_tokens":1,"output_tokens":0}}}\n\n'
+            "event: content_block_start\n"
+            'data: {"type":"content_block_start","index":0,'
+            '"content_block":{"type":"text","text":""}}\n\n'
+            "event: content_block_delta\n"
+            'data: {"type":"content_block_delta","index":0,'
+            '"delta":{"type":"text_delta","text":"hi"}}\n\n'
+            "event: message_stop\n"
+            'data: {"type":"message_stop"}\n\n'
+        )
+        httpx_mock.add_response(
+            text=sse_body,
+            headers={"content-type": "text/event-stream"},
+        )
+
+        resp = await process_request(
+            PF.ANTHROPIC_MESSAGES,
+            {
+                "model": "dual/m1",
+                "stream": True,
+                "max_tokens": 16,
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                ],
+            },
+            {"dual": provider},
+            {"dual": client},
+        )
+        assert isinstance(resp, StreamingResponse)
+        chunks = [chunk async for chunk in resp.body_iterator]
+        assert chunks
+        request = httpx_mock.get_request()
+        assert str(request.url) == (
+            "https://anthropic.example.com/v1/messages"
+        )
+        assert request.headers["x-api-key"] == "sk-top"
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_anthropic_inbound_posts_to_anthropic_url(
+        self, httpx_mock,
+    ):
+        from kllmgate.upstream.client import UpstreamClient
+
+        provider = self._dual_cfg()
+        client = UpstreamClient(provider)
+        httpx_mock.add_response(json={
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hi"}],
+            "model": "m1",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        })
+
+        await process_request(
+            PF.ANTHROPIC_MESSAGES,
+            {
+                "model": "dual/m1",
+                "max_tokens": 16,
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                ],
+            },
+            {"dual": provider},
+            {"dual": client},
+        )
+        request = httpx_mock.get_request()
+        assert str(request.url) == (
+            "https://anthropic.example.com/v1/messages"
+        )
+        assert request.headers["x-api-key"] == "sk-top"
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_missing_subsection_raises(self):
+        from kllmgate.models import ProtocolEndpointConfig
+
+        provider = ProviderConfig(
+            name="dual",
+            protocol="auto",
+            api_key="sk-top",
+            openai=ProtocolEndpointConfig(
+                base_url="https://openai.example.com/v1",
+            ),
+        )
+        with pytest.raises(ConfigError, match="anthropic"):
+            await process_request(
+                PF.ANTHROPIC_MESSAGES,
+                {
+                    "model": "dual/m1",
+                    "max_tokens": 16,
+                    "messages": [
+                        {"role": "user", "content": "hello"},
+                    ],
+                },
+                {"dual": provider},
+                {"dual": object()},
+            )
+
+    @pytest.mark.asyncio
+    async def test_responses_inbound_converts_to_chat_wire(
+        self, httpx_mock,
+    ):
+        from kllmgate.upstream.client import UpstreamClient
+
+        provider = self._dual_cfg()
+        client = UpstreamClient(provider)
+        httpx_mock.add_response(json={
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2,
+            },
+        })
+
+        resp = await process_request(
+            PF.OPENAI_RESPONSES,
+            {
+                "model": "dual/m1",
+                "input": "hello",
+            },
+            {"dual": provider},
+            {"dual": client},
+        )
+        assert resp.status_code == 200
+        request = httpx_mock.get_request()
+        assert str(request.url) == (
+            "https://openai.example.com/v1/chat/completions"
+        )
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_models_override_per_protocol(self):
+        from kllmgate.models import ProtocolEndpointConfig
+
+        provider = ProviderConfig(
+            name="dual",
+            protocol="auto",
+            api_key="sk-top",
+            models=["shared"],
+            openai=ProtocolEndpointConfig(
+                base_url="https://openai.example.com/v1",
+                models=["openai-only"],
+            ),
+            anthropic=ProtocolEndpointConfig(
+                base_url="https://anthropic.example.com",
+            ),
+        )
+        with pytest.raises(ConfigError, match="not supported"):
+            await process_request(
+                PF.OPENAI_CHAT,
+                {"model": "dual/shared", "messages": [
+                    {"role": "user", "content": "hello"},
+                ]},
+                {"dual": provider},
+                {"dual": object()},
+            )
+        with pytest.raises(ConfigError, match="not supported"):
+            await process_request(
+                PF.ANTHROPIC_MESSAGES,
+                {
+                    "model": "dual/openai-only",
+                    "max_tokens": 16,
+                    "messages": [
+                        {"role": "user", "content": "hello"},
+                    ],
+                },
+                {"dual": provider},
+                {"dual": object()},
+            )
+
+    @pytest.mark.asyncio
+    async def test_empty_models_list_rejects_all_models(self):
+        from kllmgate.models import ProtocolEndpointConfig
+
+        provider = ProviderConfig(
+            name="dual",
+            protocol="auto",
+            api_key="sk-top",
+            models=["shared"],
+            openai=ProtocolEndpointConfig(
+                base_url="https://openai.example.com/v1",
+                models=[],
+            ),
+        )
+        with pytest.raises(ConfigError, match="not supported"):
+            await process_request(
+                PF.OPENAI_CHAT,
+                {"model": "dual/shared", "messages": [
+                    {"role": "user", "content": "hello"},
+                ]},
+                {"dual": provider},
+                {"dual": object()},
+            )

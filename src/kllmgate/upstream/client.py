@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator
 import httpx
 
 from ..errors import ConversionError, UpstreamError, UpstreamHTTPError
-from ..models import ProviderConfig
+from ..models import ProviderConfig, ResolvedUpstream
 from ..sse import SseEvent, parse_sse_events
 
 logger = logging.getLogger(__name__)
@@ -95,6 +95,13 @@ def _log_error_headers(resp: httpx.Response) -> None:
         )
 
 
+def _build_endpoint(base_url: str, protocol: str, wire_api: str) -> str:
+    suffix = _ENDPOINT_MAP.get(
+        (protocol, wire_api), "/chat/completions",
+    )
+    return f"{base_url}{suffix}"
+
+
 class UpstreamClient:
 
     def __init__(self, config: ProviderConfig):
@@ -104,16 +111,44 @@ class UpstreamClient:
                 config.timeout_seconds, connect=10.0,
             ),
         )
-        key = (config.protocol, config.wire_api)
-        suffix = _ENDPOINT_MAP.get(key, "/chat/completions")
-        self._endpoint = f"{config.base_url}{suffix}"
+        if config.protocol == "auto":
+            self._endpoint: str | None = None
+        else:
+            self._endpoint = _build_endpoint(
+                config.base_url,
+                config.protocol,
+                config.wire_api or "chat",
+            )
+
+    def _resolve_target(
+        self, target: ResolvedUpstream | None,
+    ) -> ResolvedUpstream:
+        if target is not None:
+            return target
+        if self.config.protocol == "auto":
+            raise UpstreamError(
+                f"upstream target required for auto provider "
+                f"{self.config.name!r}",
+                code="missing_upstream_target",
+            )
+        return self.config.resolve_for_inbound(
+            self.config.protocol_format,
+        )
+
+    def _endpoint_for(self, target: ResolvedUpstream) -> str:
+        return _build_endpoint(
+            target.base_url, target.protocol, target.wire_api,
+        )
 
     def _build_headers(
-        self, extra_headers: dict[str, str] | None = None,
+        self,
+        extra_headers: dict[str, str] | None = None,
+        target: ResolvedUpstream | None = None,
     ) -> dict[str, str]:
-        api_key = self.config.resolve_api_key()
+        resolved = self._resolve_target(target)
+        api_key = resolved.resolve_api_key()
         headers = {"Content-Type": "application/json"}
-        if self.config.protocol == "anthropic":
+        if resolved.protocol == "anthropic":
             headers["x-api-key"] = api_key
             headers["anthropic-version"] = "2023-06-01"
             if extra_headers:
@@ -125,15 +160,18 @@ class UpstreamClient:
     async def send(
         self, body: dict,
         extra_headers: dict[str, str] | None = None,
+        target: ResolvedUpstream | None = None,
     ) -> dict:
         """发送非流式请求，返回解析后的 JSON 响应"""
-        headers = self._build_headers(extra_headers)
+        resolved = self._resolve_target(target)
+        endpoint = self._endpoint_for(resolved)
+        headers = self._build_headers(extra_headers, resolved)
         last_error: Exception | None = None
 
         for attempt in range(self.config.max_retries + 1):
             try:
                 resp = await self._client.post(
-                    self._endpoint, json=body, headers=headers,
+                    endpoint, json=body, headers=headers,
                 )
             except httpx.RequestError as e:
                 last_error = e
@@ -220,34 +258,48 @@ class UpstreamClient:
 
         返回的 detail 为脱敏分类码，不含主机名等敏感信息。
         """
-        try:
-            resp = await self._client.get(
-                self.config.base_url,
-                timeout=5.0,
-            )
-            return True, f"http_{resp.status_code}"
-        except httpx.TimeoutException as e:
-            logger.warning(
-                "Health probe timeout for provider %s: %s",
-                self.config.name, e,
-            )
-            return False, "timeout"
-        except httpx.ConnectError as e:
-            logger.warning(
-                "Health probe connect error for provider %s: %s",
-                self.config.name, e,
-            )
-            return False, "connect_error"
-        except httpx.RequestError as e:
-            logger.warning(
-                "Health probe request error for provider %s: %s",
-                self.config.name, e,
-            )
-            return False, "request_error"
+        base_urls = self._probe_base_urls()
+        last_detail = "request_error"
+        for base_url in base_urls:
+            try:
+                resp = await self._client.get(
+                    base_url,
+                    timeout=5.0,
+                )
+                return True, f"http_{resp.status_code}"
+            except httpx.TimeoutException as e:
+                logger.warning(
+                    "Health probe timeout for provider %s: %s",
+                    self.config.name, e,
+                )
+                last_detail = "timeout"
+            except httpx.ConnectError as e:
+                logger.warning(
+                    "Health probe connect error for provider %s: %s",
+                    self.config.name, e,
+                )
+                last_detail = "connect_error"
+            except httpx.RequestError as e:
+                logger.warning(
+                    "Health probe request error for provider %s: %s",
+                    self.config.name, e,
+                )
+                last_detail = "request_error"
+        return False, last_detail
+
+    def _probe_base_urls(self) -> list[str]:
+        if self.config.protocol != "auto":
+            return [self.config.base_url]
+        urls: list[str] = []
+        for endpoint in (self.config.openai, self.config.anthropic):
+            if endpoint is not None:
+                urls.append(endpoint.base_url)
+        return urls
 
     async def send_stream(
         self, body: dict,
         extra_headers: dict[str, str] | None = None,
+        target: ResolvedUpstream | None = None,
     ) -> AsyncIterator[SseEvent]:
         """发送流式请求，yield 已完成分帧的 SSE 事件
 
@@ -255,7 +307,9 @@ class UpstreamClient:
         一旦开始 yield 事件，中断将直接抛出异常，不再重试，
         避免重试导致事件重复发送。
         """
-        headers = self._build_headers(extra_headers)
+        resolved = self._resolve_target(target)
+        endpoint = self._endpoint_for(resolved)
+        headers = self._build_headers(extra_headers, resolved)
         last_error: Exception | None = None
         streaming_started = False
 
@@ -264,7 +318,7 @@ class UpstreamClient:
             try:
                 resp = await self._client.send(
                     self._client.build_request(
-                        "POST", self._endpoint, json=body, headers=headers,
+                        "POST", endpoint, json=body, headers=headers,
                     ),
                     stream=True,
                 )

@@ -11,28 +11,40 @@ _UNSUPPORTED_CAPABILITY = {"supported": False}
 def _is_routable_target(
     target: str,
     providers: dict[str, ProviderConfig],
+    protocol_family: str | None = None,
 ) -> bool:
     """alias 目标是否在 provider 可路由范围内"""
     provider_name, upstream_model = target.split("/", 1)
     provider = providers[provider_name]
-    if not provider.models:
-        return True
-    return upstream_model in provider.models
+    if protocol_family is None:
+        return provider.allows_model_for_alias(upstream_model)
+    return provider.allows_model_for_family(upstream_model, protocol_family)
 
 
 def collect_available_model_ids(
     providers: dict[str, ProviderConfig],
     model_aliases: dict[str, str],
+    protocol_family: str | None = None,
 ) -> set[str]:
-    """汇总 /models 端点可暴露的全部模型 ID（不区分协议）"""
+    """汇总 /models 可暴露的模型 ID
+
+    protocol_family 为 None 时汇总全部路径（供 models_list 启动校验）。
+    为 "openai" / "anthropic" 时仅包含该入站协议族可路由的模型。
+    """
     models: set[str] = set()
     for alias, target in model_aliases.items():
-        if _is_routable_target(target, providers):
+        if _is_routable_target(
+            target, providers, protocol_family=protocol_family,
+        ):
             models.add(alias)
     for provider_name, provider in providers.items():
-        if not provider.models:
+        if protocol_family is None:
+            exposed = provider.exposed_model_ids()
+        else:
+            exposed = provider.exposed_model_ids_for_family(protocol_family)
+        if exposed is None:
             continue
-        for model_id in provider.models:
+        for model_id in exposed:
             models.add(f"{provider_name}/{model_id}")
     return models
 
@@ -50,9 +62,12 @@ def collect_listed_models(
     providers: dict[str, ProviderConfig],
     model_aliases: dict[str, str],
     models_list: list[str] | None = None,
+    protocol_family: str | None = None,
 ) -> list[str]:
     """汇总网关对外暴露的模型 ID，并应用 models_list 白名单"""
-    model_ids = collect_available_model_ids(providers, model_aliases)
+    model_ids = collect_available_model_ids(
+        providers, model_aliases, protocol_family=protocol_family,
+    )
     return filter_model_ids(model_ids, models_list)
 
 
@@ -74,6 +89,7 @@ def openai_models_payload(
                 providers,
                 model_aliases,
                 models_list=models_list,
+                protocol_family="openai",
             )
         ],
     }
@@ -113,7 +129,10 @@ def anthropic_models_payload(
     data = [
         _anthropic_model_entry(model_id)
         for model_id in collect_listed_models(
-            providers, model_aliases, models_list=models_list,
+            providers,
+            model_aliases,
+            models_list=models_list,
+            protocol_family="anthropic",
         )
     ]
     if not data:

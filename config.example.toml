@@ -29,16 +29,29 @@ timeout_seconds = 120
 max_retries = 2
 models = ["claude-sonnet-4"]
 
-# MiniMax 代理，XML 工具调用
+# MiniMax 代理，双协议透传（OpenAI / Anthropic URL 可不同）
+# 注意：auto 下 Anthropic 入站会直连下方 anthropic.base_url，
+# 不再转换成 OpenAI 再发往 openai.base_url。
+# 若两套网关 key 不同，请在对应子表覆盖 api_key / env_key。
 [providers.minimax_proxy]
-base_url = "https://api.scnet.cn/api/llm/v1"
+protocol = "auto"
 # api_key = "sk-xxx"
 env_key = "SCNET_API_KEY"
-protocol = "openai"
-wire_api = "chat"
-tool_style = "minimax_xml"              # standard | minimax_xml
 timeout_seconds = 120
 max_retries = 5
+# models = ["MiniMax-M2.5"]             # 顶层默认白名单；子表可覆盖
+# strip_system_prompt = true
+
+[providers.minimax_proxy.openai]
+base_url = "https://api.scnet.cn/api/llm/v1"
+wire_api = "chat"
+tool_style = "minimax_xml"              # standard | minimax_xml
+
+[providers.minimax_proxy.anthropic]
+base_url = "https://api.minimaxi.com/anthropic"
+# 若与顶层 SCNET_API_KEY 不同，在此单独配置：
+# env_key = "MINIMAX_API_KEY"
+# api_key = "sk-xxx"
 
 # DeepSeek 本地（vLLM/Ollama 等，原生 token 工具调用）
 # [providers.deepseek_local]
@@ -83,9 +96,19 @@ max_retries = 5
 # timeout_seconds = 300
 # max_retries = 1
 
-# 字段速查：base_url（末尾无 /）、api_key、env_key、protocol（openai|anthropic）
+# 字段速查：base_url（末尾无 /）、api_key、env_key、protocol（openai|anthropic|auto）
 # wire_api（chat|responses|messages）、tool_style、thinking_style、models、models_list
+# strip_system_prompt（bool，默认 false）：转发前移除入站 system/developer 提示
 # thinking_style: think | thinking_token | lvl_entry | disabled
+#
+# protocol=auto：入站协议有对应子表则透传；无子表则报错。
+# auto 顶层禁止 base_url/wire_api/tool_style/thinking_style；
+# 子表仅允许各自白名单字段，未知字段启动报错；
+# tool_style/thinking_style 仅写在 [providers.x.openai]；
+# models 顶层为默认，子表可覆盖（空列表表示该路径禁用全部模型）；
+# /openai/models 与 /anthropic/v1/models 按可路由协议族分别列出；
+# api_key/env_key 顶层默认，子表可覆盖；
+# 子表仅配 env_key 且环境变量为空时，会回退顶层 api_key/env_key。
 #
 # 模型路由（优先级从高到低）：
 # 1. model = "provider/model"

@@ -37,10 +37,21 @@ def create_app(config: GatewayConfig) -> FastAPI:
         clients: dict[str, UpstreamClient] = {}
         for name, cfg in config.providers.items():
             clients[name] = UpstreamClient(cfg)
-            logger.info(
-                "Initialized upstream client: %s (%s)",
-                name, cfg.protocol_format.value,
-            )
+            if cfg.protocol == "auto":
+                parts = []
+                if cfg.openai is not None:
+                    parts.append("openai")
+                if cfg.anthropic is not None:
+                    parts.append("anthropic")
+                logger.info(
+                    "Initialized upstream client: %s (auto:%s)",
+                    name, "+".join(parts),
+                )
+            else:
+                logger.info(
+                    "Initialized upstream client: %s (%s)",
+                    name, cfg.protocol_format.value,
+                )
         app.state.providers = config.providers
         app.state.upstream_clients = clients
         app.state.model_aliases = config.model_aliases

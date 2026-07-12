@@ -286,6 +286,39 @@ class TestAnthropicModels:
             }
         assert openai_ids == anthropic_ids
 
+    def test_auto_provider_models_filtered_by_inbound_family(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(textwrap.dedent("""\
+            [providers.dual]
+            protocol = "auto"
+            api_key = "sk-test"
+            models = ["shared"]
+
+            [providers.dual.openai]
+            base_url = "https://openai.example.com/v1"
+            models = ["openai-only"]
+
+            [providers.dual.anthropic]
+            base_url = "https://anthropic.example.com"
+            models = ["anthropic-only"]
+
+            [model_aliases]
+            "OpenAI-Only" = "dual/openai-only"
+            "Anthropic-Only" = "dual/anthropic-only"
+        """))
+        with TestClient(create_app(load_config(str(path)))) as c:
+            openai_ids = {
+                item["id"] for item in c.get("/openai/models").json()["data"]
+            }
+            anthropic_ids = {
+                item["id"]
+                for item in c.get("/anthropic/v1/models").json()["data"]
+            }
+        assert openai_ids == {"OpenAI-Only", "dual/openai-only"}
+        assert anthropic_ids == {"Anthropic-Only", "dual/anthropic-only"}
+        assert "dual/openai-only" not in anthropic_ids
+        assert "dual/anthropic-only" not in openai_ids
+
     def test_anthropic_models_filters_by_server_list(self, tmp_path):
         path = tmp_path / "config.toml"
         path.write_text(textwrap.dedent("""\

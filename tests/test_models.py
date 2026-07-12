@@ -179,3 +179,172 @@ class TestProviderConfig:
             protocol="openai",
         )
         assert cfg.base_url == "https://api.example.com/v1/"
+
+
+class TestResolveForInbound:
+
+    def test_single_openai_ignores_inbound_anthropic(self):
+        cfg = ProviderConfig(
+            name="test",
+            base_url="https://api.example.com/v1",
+            api_key="sk-test",
+            protocol="openai",
+            wire_api="chat",
+        )
+        resolved = cfg.resolve_for_inbound(ProtocolFormat.ANTHROPIC_MESSAGES)
+        assert resolved.protocol == "openai"
+        assert resolved.protocol_format == ProtocolFormat.OPENAI_CHAT
+        assert resolved.base_url == "https://api.example.com/v1"
+
+    def test_auto_openai_inbound_uses_openai_subsection(self):
+        from kllmgate.models import ProtocolEndpointConfig
+
+        cfg = ProviderConfig(
+            name="dual",
+            protocol="auto",
+            api_key="sk-top",
+            openai=ProtocolEndpointConfig(
+                base_url="https://openai.example.com/v1",
+                wire_api="chat",
+                tool_style="minimax_xml",
+            ),
+            anthropic=ProtocolEndpointConfig(
+                base_url="https://anthropic.example.com",
+                wire_api="messages",
+            ),
+        )
+        resolved = cfg.resolve_for_inbound(ProtocolFormat.OPENAI_CHAT)
+        assert resolved.base_url == "https://openai.example.com/v1"
+        assert resolved.protocol_format == ProtocolFormat.OPENAI_CHAT
+        assert resolved.tool_style == "minimax_xml"
+        assert resolved.resolve_api_key() == "sk-top"
+
+    def test_auto_anthropic_inbound_uses_anthropic_subsection(self):
+        from kllmgate.models import ProtocolEndpointConfig
+
+        cfg = ProviderConfig(
+            name="dual",
+            protocol="auto",
+            api_key="sk-top",
+            openai=ProtocolEndpointConfig(
+                base_url="https://openai.example.com/v1",
+            ),
+            anthropic=ProtocolEndpointConfig(
+                base_url="https://anthropic.example.com",
+                api_key="sk-ant",
+            ),
+        )
+        resolved = cfg.resolve_for_inbound(ProtocolFormat.ANTHROPIC_MESSAGES)
+        assert resolved.base_url == "https://anthropic.example.com"
+        assert resolved.protocol_format == ProtocolFormat.ANTHROPIC_MESSAGES
+        assert resolved.resolve_api_key() == "sk-ant"
+
+    def test_auto_responses_inbound_still_uses_openai_subsection(self):
+        from kllmgate.models import ProtocolEndpointConfig
+
+        cfg = ProviderConfig(
+            name="dual",
+            protocol="auto",
+            api_key="sk-top",
+            openai=ProtocolEndpointConfig(
+                base_url="https://openai.example.com/v1",
+                wire_api="chat",
+            ),
+        )
+        resolved = cfg.resolve_for_inbound(ProtocolFormat.OPENAI_RESPONSES)
+        assert resolved.protocol_format == ProtocolFormat.OPENAI_CHAT
+        assert resolved.base_url == "https://openai.example.com/v1"
+
+    def test_auto_missing_subsection_raises(self):
+        from kllmgate.models import ProtocolEndpointConfig
+
+        cfg = ProviderConfig(
+            name="dual",
+            protocol="auto",
+            api_key="sk-top",
+            openai=ProtocolEndpointConfig(
+                base_url="https://openai.example.com/v1",
+            ),
+        )
+        with pytest.raises(ConfigError, match="anthropic"):
+            cfg.resolve_for_inbound(ProtocolFormat.ANTHROPIC_MESSAGES)
+
+    def test_auto_models_override(self):
+        from kllmgate.models import ProtocolEndpointConfig
+
+        cfg = ProviderConfig(
+            name="dual",
+            protocol="auto",
+            api_key="sk-top",
+            models=["shared"],
+            openai=ProtocolEndpointConfig(
+                base_url="https://openai.example.com/v1",
+                models=["openai-only"],
+            ),
+            anthropic=ProtocolEndpointConfig(
+                base_url="https://anthropic.example.com",
+            ),
+        )
+        assert cfg.resolve_for_inbound(
+            ProtocolFormat.OPENAI_CHAT,
+        ).models == ["openai-only"]
+        assert cfg.resolve_for_inbound(
+            ProtocolFormat.ANTHROPIC_MESSAGES,
+        ).models == ["shared"]
+
+    def test_auto_protocol_format_property_raises(self):
+        cfg = ProviderConfig(
+            name="dual",
+            base_url="",
+            protocol="auto",
+            api_key="sk-top",
+        )
+        with pytest.raises(ConfigError, match="auto"):
+            _ = cfg.protocol_format
+
+    def test_positional_args_name_base_url_protocol(self):
+        cfg = ProviderConfig(
+            "test",
+            "https://api.example.com/v1",
+            "openai",
+        )
+        assert cfg.name == "test"
+        assert cfg.base_url == "https://api.example.com/v1"
+        assert cfg.protocol == "openai"
+        assert cfg.protocol_format == ProtocolFormat.OPENAI_CHAT
+
+    def test_subsection_env_key_falls_back_to_top_api_key(
+        self, monkeypatch,
+    ):
+        from kllmgate.models import ProtocolEndpointConfig
+
+        monkeypatch.delenv("MISSING_SUB_KEY", raising=False)
+        cfg = ProviderConfig(
+            name="dual",
+            base_url="",
+            protocol="auto",
+            api_key="sk-top",
+            openai=ProtocolEndpointConfig(
+                base_url="https://openai.example.com/v1",
+                env_key="MISSING_SUB_KEY",
+            ),
+        )
+        resolved = cfg.resolve_for_inbound(ProtocolFormat.OPENAI_CHAT)
+        assert resolved.resolve_api_key() == "sk-top"
+
+    def test_subsection_env_key_wins_when_present(self, monkeypatch):
+        from kllmgate.models import ProtocolEndpointConfig
+
+        monkeypatch.setenv("SUB_KEY", "sk-sub")
+        cfg = ProviderConfig(
+            name="dual",
+            base_url="",
+            protocol="auto",
+            api_key="sk-top",
+            openai=ProtocolEndpointConfig(
+                base_url="https://openai.example.com/v1",
+                env_key="SUB_KEY",
+            ),
+        )
+        resolved = cfg.resolve_for_inbound(ProtocolFormat.OPENAI_CHAT)
+        assert resolved.resolve_api_key() == "sk-sub"
