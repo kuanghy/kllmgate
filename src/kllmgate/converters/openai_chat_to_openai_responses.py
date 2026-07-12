@@ -35,20 +35,20 @@ class OpenaiChatToOpenaiResponsesConverter(Converter):
 
             if role == "assistant":
                 tool_calls = msg.get("tool_calls", [])
-                if tool_calls:
-                    for tc in tool_calls:
-                        func = tc.get("function", {})
-                        input_items.append({
-                            "type": "function_call",
-                            "call_id": tc.get("id", ""),
-                            "name": func.get("name", ""),
-                            "arguments": func.get("arguments", ""),
-                        })
-                    continue
-                input_items.append({
-                    "role": "model",
-                    "content": msg.get("content", ""),
-                })
+                content = msg.get("content", "")
+                if content or not tool_calls:
+                    input_items.append({
+                        "role": "model",
+                        "content": content or "",
+                    })
+                for tc in tool_calls:
+                    func = tc.get("function", {})
+                    input_items.append({
+                        "type": "function_call",
+                        "call_id": tc.get("id", ""),
+                        "name": func.get("name", ""),
+                        "arguments": func.get("arguments", ""),
+                    })
                 continue
 
             if role == "tool":
@@ -133,6 +133,10 @@ class OpenaiChatToOpenaiResponsesConverter(Converter):
     ) -> AsyncIterator[str]:
         resp_id = ""
         model_name = ""
+        # output_index → OpenAI tool_calls index
+        tool_index_by_output: dict[int, int] = {}
+        next_tool_index = 0
+        saw_tool_call = False
 
         async for event in upstream_events:
             if not event.event:
@@ -170,7 +174,15 @@ class OpenaiChatToOpenaiResponsesConverter(Converter):
                     }],
                 })
 
-            elif event.event == "response.function_call_arguments.delta":
+            elif event.event == "response.output_item.added":
+                item = data.get("item", {})
+                if item.get("type") != "function_call":
+                    continue
+                saw_tool_call = True
+                output_index = data.get("output_index", next_tool_index)
+                tool_index = next_tool_index
+                tool_index_by_output[output_index] = tool_index
+                next_tool_index += 1
                 yield format_data_only_sse({
                     "id": resp_id,
                     "object": "chat.completion.chunk",
@@ -179,7 +191,32 @@ class OpenaiChatToOpenaiResponsesConverter(Converter):
                         "index": 0,
                         "delta": {
                             "tool_calls": [{
-                                "index": 0,
+                                "index": tool_index,
+                                "id": item.get(
+                                    "call_id", item.get("id", ""),
+                                ),
+                                "type": "function",
+                                "function": {
+                                    "name": item.get("name", ""),
+                                    "arguments": "",
+                                },
+                            }],
+                        },
+                    }],
+                })
+
+            elif event.event == "response.function_call_arguments.delta":
+                output_index = data.get("output_index", 0)
+                tool_index = tool_index_by_output.get(output_index, 0)
+                yield format_data_only_sse({
+                    "id": resp_id,
+                    "object": "chat.completion.chunk",
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": tool_index,
                                 "function": {
                                     "arguments": data.get("delta", ""),
                                 },
@@ -192,6 +229,9 @@ class OpenaiChatToOpenaiResponsesConverter(Converter):
                 resp_obj = data.get("response", {})
                 usage = resp_obj.get("usage", {})
                 chat_usage = responses_usage_to_chat(usage)
+                finish_reason = (
+                    "tool_calls" if saw_tool_call else "stop"
+                )
                 yield format_data_only_sse({
                     "id": resp_id,
                     "object": "chat.completion.chunk",
@@ -199,7 +239,7 @@ class OpenaiChatToOpenaiResponsesConverter(Converter):
                     "choices": [{
                         "index": 0,
                         "delta": {},
-                        "finish_reason": "stop",
+                        "finish_reason": finish_reason,
                     }],
                     "usage": chat_usage,
                 })

@@ -48,6 +48,9 @@ def resolve_config(cli_arg: str | None) -> str:
 
 _VALID_PROTOCOLS = {"openai", "anthropic"}
 _VALID_WIRE_APIS = {"chat", "responses", "messages"}
+_VALID_THINKING_STYLES = {
+    "disabled", "think", "thinking_token", "lvl_entry",
+}
 _VALID_LOG_LEVELS = {"debug", "info", "warning", "error"}
 
 
@@ -201,6 +204,15 @@ def _parse_provider(name: str, section: dict) -> ProviderConfig:
 
     base_url = section["base_url"].rstrip("/")
 
+    thinking_style = section.get("thinking_style", "disabled")
+    if thinking_style not in _VALID_THINKING_STYLES:
+        raise ConfigError(
+            f"provider {name!r}: invalid thinking_style "
+            f"{thinking_style!r}, must be one of "
+            f"{sorted(_VALID_THINKING_STYLES)}",
+            code="invalid_thinking_style",
+        )
+
     provider = ProviderConfig(
         name=name,
         base_url=base_url,
@@ -209,6 +221,7 @@ def _parse_provider(name: str, section: dict) -> ProviderConfig:
         protocol=protocol,
         wire_api=wire_api,
         tool_style=section.get("tool_style", "standard"),
+        thinking_style=thinking_style,
         timeout_seconds=section.get("timeout_seconds", 120),
         max_retries=section.get("max_retries", 2),
         models=section.get("models"),

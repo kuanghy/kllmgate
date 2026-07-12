@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator
 
 import httpx
 
-from ..errors import UpstreamError, UpstreamHTTPError
+from ..errors import ConversionError, UpstreamError, UpstreamHTTPError
 from ..models import ProviderConfig
 from ..sse import SseEvent, parse_sse_events
 
@@ -201,12 +202,48 @@ class UpstreamClient:
                     _collect_forward_headers(resp),
                 )
 
-            return resp.json()
+            try:
+                return resp.json()
+            except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
+                raise ConversionError(
+                    f"upstream returned non-JSON response: {e}",
+                    code="invalid_upstream_json",
+                ) from e
 
         raise UpstreamError(
             f"exhausted retries: {last_error}",
             code="upstream_request_error",
         )
+
+    async def check_reachable(self) -> tuple[bool, str]:
+        """探测上游是否可达（任意 HTTP 响应均视为可达）
+
+        返回的 detail 为脱敏分类码，不含主机名等敏感信息。
+        """
+        try:
+            resp = await self._client.get(
+                self.config.base_url,
+                timeout=5.0,
+            )
+            return True, f"http_{resp.status_code}"
+        except httpx.TimeoutException as e:
+            logger.warning(
+                "Health probe timeout for provider %s: %s",
+                self.config.name, e,
+            )
+            return False, "timeout"
+        except httpx.ConnectError as e:
+            logger.warning(
+                "Health probe connect error for provider %s: %s",
+                self.config.name, e,
+            )
+            return False, "connect_error"
+        except httpx.RequestError as e:
+            logger.warning(
+                "Health probe request error for provider %s: %s",
+                self.config.name, e,
+            )
+            return False, "request_error"
 
     async def send_stream(
         self, body: dict,

@@ -107,6 +107,14 @@ class ConversionError(GatewayError):
     code = "conversion_error"
 
 
+class InternalError(GatewayError):
+    """未预期的内部错误，对外协议化为 server_error"""
+
+    status_code = 500
+    error_type = "server_error"
+    code = "internal_error"
+
+
 _ERROR_SOURCE_HEADER = "X-KLLMGate-Error-Source"
 
 

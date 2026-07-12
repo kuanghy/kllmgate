@@ -326,6 +326,98 @@ class TestHealthCheck:
         resp = client.head("/unknown")
         assert resp.status_code == 404
 
+    def test_health_ready_reports_providers(self, client, httpx_mock):
+        # 任意 HTTP 响应（含 401）均视为上游可达
+        httpx_mock.add_response(status_code=200)
+        httpx_mock.add_response(status_code=401)
+        resp = client.get("/health/ready")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "ready"
+        assert "test_openai" in body["providers"]
+        assert "test_anthropic" in body["providers"]
+        assert body["providers"]["test_openai"]["ok"] is True
+        assert body["providers"]["test_anthropic"]["ok"] is True
+        assert body["providers"]["test_openai"]["detail"].startswith("http_")
+        assert body["providers"]["test_anthropic"]["detail"].startswith("http_")
+
+    def test_health_ready_503_when_all_unreachable(self, client, httpx_mock):
+        import httpx
+
+        httpx_mock.add_exception(httpx.ConnectError("fail"))
+        httpx_mock.add_exception(httpx.ConnectError("fail"))
+        resp = client.get("/health/ready")
+        assert resp.status_code == 503
+        body = resp.json()
+        assert body["status"] == "not_ready"
+        assert body["providers"]["test_openai"]["ok"] is False
+        assert body["providers"]["test_anthropic"]["ok"] is False
+
+    def test_health_ready_probes_providers_in_parallel(self, app):
+        import asyncio
+        import time
+        from unittest.mock import AsyncMock
+
+        async def _slow_probe(*_args, **_kwargs):
+            await asyncio.sleep(0.25)
+            return True, "HTTP 200"
+
+        with TestClient(app) as client:
+            for upstream in client.app.state.upstream_clients.values():
+                upstream.check_reachable = AsyncMock(side_effect=_slow_probe)
+            # 若串行约 0.5s+；并行约 0.25s
+            started = time.monotonic()
+            resp = client.get("/health/ready")
+            elapsed = time.monotonic() - started
+
+        assert resp.status_code == 200
+        assert elapsed < 0.45
+
+    def test_health_ready_isolates_probe_exceptions(self, app, caplog):
+        import logging
+        from unittest.mock import AsyncMock
+
+        with TestClient(app) as client:
+            clients = client.app.state.upstream_clients
+            names = list(clients.keys())
+            assert len(names) >= 2
+            clients[names[0]].check_reachable = AsyncMock(
+                side_effect=RuntimeError("boom probe secret-host"),
+            )
+            clients[names[1]].check_reachable = AsyncMock(
+                return_value=(True, "http_200"),
+            )
+            with caplog.at_level(logging.WARNING, logger="kllmgate.app"):
+                resp = client.get("/health/ready")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "ready"
+        assert body["providers"][names[0]]["ok"] is False
+        assert body["providers"][names[0]]["detail"] == "probe_error"
+        assert "secret-host" not in resp.text
+        assert body["providers"][names[1]]["ok"] is True
+        assert any(
+            "secret-host" in r.getMessage() for r in caplog.records
+        )
+
+    def test_health_ready_unreachable_detail_is_sanitized(
+        self, client, httpx_mock,
+    ):
+        import httpx
+
+        httpx_mock.add_exception(
+            httpx.ConnectError('连接失败: host="internal.svc.local"'),
+        )
+        httpx_mock.add_exception(
+            httpx.ConnectError('连接失败: host="internal.svc.local"'),
+        )
+        resp = client.get("/health/ready")
+        assert resp.status_code == 503
+        body = resp.json()
+        assert body["providers"]["test_openai"]["detail"] == "connect_error"
+        assert "internal.svc.local" not in resp.text
+
 
 class TestExtractForwardHeaders:
 

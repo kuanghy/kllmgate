@@ -11,6 +11,7 @@ from kllmgate.errors import (
     UpstreamError,
     UpstreamHTTPError,
     ConversionError,
+    InternalError,
     _extract_upstream_error_fields,
     format_error_response,
 )
@@ -88,9 +89,16 @@ class TestErrorHierarchy:
         assert e.code == "conversion_error"
         assert isinstance(e, GatewayError)
 
+    def test_internal_error(self):
+        e = InternalError("unexpected boom")
+        assert e.status_code == 500
+        assert e.error_type == "server_error"
+        assert e.code == "internal_error"
+        assert isinstance(e, GatewayError)
+
     def test_all_errors_are_exceptions(self):
         for cls in (GatewayError, ConfigError, ProtocolError,
-                    UpstreamError, ConversionError):
+                    UpstreamError, ConversionError, InternalError):
             e = cls("test")
             assert isinstance(e, Exception)
 

@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
 import uuid
 from collections.abc import AsyncIterator
+from typing import TYPE_CHECKING
 
 from fastapi.responses import JSONResponse, StreamingResponse
+
+if TYPE_CHECKING:
+    from fastapi import Request
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +42,7 @@ from .converters.anthropic_messages_to_openai_responses import (
     AnthropicMessagesToOpenaiResponsesConverter,
 )
 from .errors import (
-    ConfigError, ConversionError, GatewayError,
+    ConfigError, ConversionError, GatewayError, InternalError,
     UpstreamError, UpstreamHTTPError,
 )
 from .models import ProtocolFormat, ProviderConfig
@@ -324,7 +329,18 @@ def _make_stream_error_events(
     if inbound_format == PF.OPENAI_CHAT:
         return [
             format_data_only_sse({
-                "choices": [{"delta": {}, "finish_reason": None}],
+                "id": "chatcmpl-error",
+                "object": "chat.completion.chunk",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "error",
+                }],
+                "error": {
+                    "message": error_msg,
+                    "type": "server_error",
+                    "code": "stream_interrupted",
+                },
             }),
             "data: [DONE]\n\n",
         ]
@@ -339,6 +355,17 @@ def _make_stream_error_events(
     return []
 
 
+async def _aclose_async_iterator(stream: AsyncIterator) -> None:
+    """显式关闭异步迭代器，确保上游 HTTP 流及时释放"""
+    aclose = getattr(stream, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await aclose()
+    except Exception:
+        logger.debug("Failed to close async iterator", exc_info=True)
+
+
 async def _logged_stream(
     converter_stream: AsyncIterator[str],
     request_id: str,
@@ -347,13 +374,35 @@ async def _logged_stream(
     model: str,
     stream_usage: dict,
     start_time: float,
+    http_request: Request | None = None,
 ) -> AsyncIterator[str]:
     """包装 converter 输出流，提供错误处理与请求日志"""
     status = "ok"
     error_type_val: str | None = None
     try:
         async for chunk in converter_stream:
+            if http_request is not None:
+                try:
+                    disconnected = await http_request.is_disconnected()
+                except Exception:
+                    disconnected = False
+                if disconnected:
+                    logger.info(
+                        "Client disconnected mid-stream: "
+                        "request_id=%s protocol=%s provider=%s model=%s",
+                        request_id, inbound_format.value, provider, model,
+                    )
+                    status = "client_disconnected"
+                    return
             yield chunk
+    except asyncio.CancelledError:
+        status = "client_disconnected"
+        logger.info(
+            "Client disconnected mid-stream (cancelled): "
+            "request_id=%s protocol=%s provider=%s model=%s",
+            request_id, inbound_format.value, provider, model,
+        )
+        raise
     except Exception as e:
         status = "error"
         error_type_val = getattr(e, "error_type", "server_error")
@@ -363,15 +412,19 @@ async def _logged_stream(
                 type(e).__name__, e.message,
                 text_shorten(e.upstream_body, 200) if e.upstream_body else "",
             )
+            client_message = e.message
         elif isinstance(e, (UpstreamError, ConversionError)):
             logger.warning("%s: %s", type(e).__name__, e.message)
+            client_message = e.message
         else:
             logger.error("Stream error: %s", e, exc_info=True)
+            client_message = "internal server error"
         for event_text in _make_stream_error_events(
-            inbound_format, str(e),
+            inbound_format, client_message,
         ):
             yield event_text
     finally:
+        await _aclose_async_iterator(converter_stream)
         _log_request(
             request_id, inbound_format, provider, model,
             True, start_time, stream_usage, status, error_type_val,
@@ -387,6 +440,7 @@ async def process_request(
     model_aliases: dict[str, str] | None = None,
     default_provider: str | None = None,
     forward_headers: dict[str, str] | None = None,
+    http_request: Request | None = None,
 ) -> JSONResponse | StreamingResponse:
     request_id = uuid.uuid4().hex
     start_time = time.monotonic()
@@ -466,6 +520,7 @@ async def process_request(
                     event_stream, request_id, inbound_format,
                     provider_name, upstream_model,
                     stream_usage, start_time,
+                    http_request=http_request,
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -509,4 +564,7 @@ async def process_request(
             {}, "error", "server_error",
         )
         logger.error("Unexpected error: %s", e, exc_info=True)
-        raise
+        raise InternalError(
+            "internal server error",
+            code="internal_error",
+        ) from e

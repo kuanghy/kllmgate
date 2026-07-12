@@ -455,6 +455,40 @@ class TestOpenaiChatToOpenaiResponsesRequest:
         assert len(fc_items) == 1
         assert len(fco_items) == 1
 
+    def test_assistant_content_preserved_with_tool_calls(self):
+        body = {
+            "model": "p/m",
+            "messages": [
+                {"role": "user", "content": "weather?"},
+                {
+                    "role": "assistant",
+                    "content": "Let me check.",
+                    "tool_calls": [{
+                        "id": "c1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"city": "BJ"}',
+                        },
+                    }],
+                },
+            ],
+        }
+        result = self.converter.convert_request(body, "m")
+        model_msgs = [
+            i for i in result["input"] if i.get("role") == "model"
+        ]
+        fc_items = [
+            i for i in result["input"]
+            if i.get("type") == "function_call"
+        ]
+        assert len(model_msgs) == 1
+        assert model_msgs[0]["content"] == "Let me check."
+        assert len(fc_items) == 1
+        assert result["input"].index(model_msgs[0]) < result["input"].index(
+            fc_items[0],
+        )
+
 
 class TestOpenaiChatToOpenaiResponsesResponse:
 
@@ -515,6 +549,83 @@ class TestOpenaiChatToOpenaiResponsesResponse:
         }
         result = self.converter.convert_response(resp)
         assert result["choices"][0]["finish_reason"] == "length"
+
+
+class TestOpenaiChatToOpenaiResponsesStream:
+
+    def setup_method(self):
+        self.converter = OpenaiChatToOpenaiResponsesConverter(
+            StandardToolAdapter(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_stream_tool_call_emits_id_name_and_index(self):
+        events = [
+            SseEvent("response.created", json.dumps({
+                "type": "response.created",
+                "response": {"id": "resp_1", "model": "m"},
+            }), []),
+            SseEvent("response.output_item.added", json.dumps({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "get_weather",
+                    "arguments": "",
+                },
+            }), []),
+            SseEvent("response.function_call_arguments.delta", json.dumps({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": '{"city":',
+            }), []),
+            SseEvent("response.function_call_arguments.delta", json.dumps({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": '"BJ"}',
+            }), []),
+            SseEvent("response.output_item.added", json.dumps({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_2",
+                    "call_id": "call_2",
+                    "name": "get_time",
+                    "arguments": "",
+                },
+            }), []),
+            SseEvent("response.function_call_arguments.delta", json.dumps({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 1,
+                "delta": "{}",
+            }), []),
+            SseEvent("response.completed", json.dumps({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "model": "m",
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 2,
+                        "total_tokens": 3,
+                    },
+                },
+            }), []),
+        ]
+        chunks = await _collect_stream(self.converter, events)
+        full = "".join(chunks)
+        assert '"id": "call_1"' in full or '"id":"call_1"' in full
+        assert '"name": "get_weather"' in full or '"name":"get_weather"' in full
+        assert '"id": "call_2"' in full or '"id":"call_2"' in full
+        assert '"name": "get_time"' in full or '"name":"get_time"' in full
+        assert '"index": 1' in full or '"index":1' in full
+        assert '"finish_reason": "tool_calls"' in full or (
+            '"finish_reason":"tool_calls"' in full
+        )
 
 
 # ──────── OpenaiChatToAnthropicMessages ────────
@@ -665,6 +776,77 @@ class TestOpenaiChatToAnthropicMessagesResponse:
             }
             result = self.converter.convert_response(resp)
             assert result["choices"][0]["finish_reason"] == expected
+
+
+class TestOpenaiChatToAnthropicMessagesStream:
+
+    def setup_method(self):
+        self.converter = OpenaiChatToAnthropicMessagesConverter(
+            AnthropicToolAdapter(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_stream_tool_use_emits_id_name_and_index(self):
+        events = [
+            SseEvent("message_start", json.dumps({
+                "type": "message_start",
+                "message": {"id": "msg_1", "model": "claude", "usage": {}},
+            }), []),
+            SseEvent("content_block_start", json.dumps({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "tu_1",
+                    "name": "get_weather",
+                    "input": {},
+                },
+            }), []),
+            SseEvent("content_block_delta", json.dumps({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": '{"city":"BJ"}',
+                },
+            }), []),
+            SseEvent("content_block_start", json.dumps({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "tu_2",
+                    "name": "get_time",
+                    "input": {},
+                },
+            }), []),
+            SseEvent("content_block_delta", json.dumps({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": "{}",
+                },
+            }), []),
+            SseEvent("message_delta", json.dumps({
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use"},
+                "usage": {"output_tokens": 5},
+            }), []),
+            SseEvent("message_stop", json.dumps({
+                "type": "message_stop",
+            }), []),
+        ]
+        chunks = await _collect_stream(self.converter, events)
+        full = "".join(chunks)
+        assert '"id": "tu_1"' in full or '"id":"tu_1"' in full
+        assert '"name": "get_weather"' in full or '"name":"get_weather"' in full
+        assert '"id": "tu_2"' in full or '"id":"tu_2"' in full
+        assert '"name": "get_time"' in full or '"name":"get_time"' in full
+        assert '"index": 1' in full or '"index":1' in full
+        assert '"finish_reason": "tool_calls"' in full or (
+            '"finish_reason":"tool_calls"' in full
+        )
 
 
 # ──────── AnthropicMessagesToOpenaiChat ────────

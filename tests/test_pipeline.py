@@ -1,5 +1,7 @@
 """管线与路由选择的单元测试"""
 
+import json
+
 import pytest
 
 from kllmgate.models import ProtocolFormat, ProviderConfig
@@ -342,3 +344,253 @@ class TestProcessRequest:
         assert req_body["input"][0].get("role") == "user"
         assert req_body["input"][1] == "direct text"
         await client.close()
+
+    @pytest.mark.asyncio
+    async def test_non_json_upstream_raises_conversion_error(
+        self, httpx_mock,
+    ):
+        from kllmgate.errors import ConversionError
+        from kllmgate.upstream.client import UpstreamClient
+
+        providers = {"test": _cfg()}
+        client = UpstreamClient(providers["test"])
+        clients = {"test": client}
+
+        httpx_mock.add_response(
+            status_code=200,
+            text="not-json-at-all",
+            headers={"content-type": "text/plain"},
+        )
+
+        with pytest.raises(ConversionError) as exc_info:
+            await process_request(
+                PF.OPENAI_CHAT,
+                {"model": "test/gpt-4", "messages": [
+                    {"role": "user", "content": "hello"},
+                ]},
+                providers,
+                clients,
+            )
+        assert exc_info.value.status_code == 502
+        assert exc_info.value.error_type == "conversion_error"
+        assert "JSON" in exc_info.value.message or "json" in (
+            exc_info.value.message.lower()
+        )
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_invalid_utf8_upstream_raises_conversion_error(
+        self, httpx_mock,
+    ):
+        from kllmgate.errors import ConversionError
+        from kllmgate.upstream.client import UpstreamClient
+
+        providers = {"test": _cfg()}
+        client = UpstreamClient(providers["test"])
+        clients = {"test": client}
+
+        httpx_mock.add_response(
+            status_code=200,
+            content=b"\xff\xfe not utf-8",
+            headers={"content-type": "application/json"},
+        )
+
+        with pytest.raises(ConversionError) as exc_info:
+            await process_request(
+                PF.OPENAI_CHAT,
+                {"model": "test/gpt-4", "messages": [
+                    {"role": "user", "content": "hello"},
+                ]},
+                providers,
+                clients,
+            )
+        assert exc_info.value.status_code == 502
+        assert exc_info.value.error_type == "conversion_error"
+        assert exc_info.value.code == "invalid_upstream_json"
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_unexpected_exception_wrapped_as_internal_error(self):
+        from kllmgate.errors import InternalError
+
+        providers = {"test": _cfg()}
+
+        class _BoomClient:
+            async def send(self, body, extra_headers=None):
+                raise RuntimeError("simulated bug with secret path")
+
+        with pytest.raises(InternalError) as exc_info:
+            await process_request(
+                PF.OPENAI_CHAT,
+                {"model": "test/gpt-4", "messages": [
+                    {"role": "user", "content": "hello"},
+                ]},
+                providers,
+                {"test": _BoomClient()},
+            )
+        err = exc_info.value
+        assert err.status_code == 500
+        assert err.error_type == "server_error"
+        assert err.code == "internal_error"
+        assert err.message == "internal server error"
+        assert "secret" not in err.message
+        assert "simulated bug" not in err.message
+
+
+class TestMakeStreamErrorEvents:
+
+    def test_openai_chat_includes_error_signal(self):
+        from kllmgate.pipeline import _make_stream_error_events
+
+        events = _make_stream_error_events(
+            PF.OPENAI_CHAT, "upstream boom",
+        )
+        assert len(events) >= 2
+        assert events[-1] == "data: [DONE]\n\n"
+        payload = json.loads(events[0].removeprefix("data: ").strip())
+        assert payload["choices"][0]["finish_reason"] == "error"
+        assert payload["error"]["message"] == "upstream boom"
+        assert payload["error"]["code"] == "stream_interrupted"
+
+    def test_openai_responses_incomplete_status(self):
+        from kllmgate.pipeline import _make_stream_error_events
+
+        events = _make_stream_error_events(
+            PF.OPENAI_RESPONSES, "upstream boom",
+        )
+        assert len(events) == 1
+        assert "incomplete" in events[0]
+        assert "stream_interrupted" in events[0]
+
+
+class TestLoggedStreamDisconnect:
+
+    @pytest.mark.asyncio
+    async def test_logs_when_client_disconnected(self, caplog):
+        import logging
+        from unittest.mock import AsyncMock, MagicMock
+
+        from kllmgate.pipeline import _logged_stream
+
+        closed = {"done": False}
+
+        async def _chunks():
+            try:
+                yield "data: one\n\n"
+                yield "data: two\n\n"
+            finally:
+                closed["done"] = True
+
+        http_request = MagicMock()
+        http_request.is_disconnected = AsyncMock(
+            side_effect=[False, True],
+        )
+
+        with caplog.at_level(logging.INFO, logger="kllmgate.pipeline"):
+            out = [
+                chunk async for chunk in _logged_stream(
+                    _chunks(),
+                    "req123",
+                    PF.OPENAI_CHAT,
+                    "test",
+                    "gpt-4",
+                    {},
+                    0.0,
+                    http_request=http_request,
+                )
+            ]
+
+        assert out == ["data: one\n\n"]
+        assert closed["done"] is True
+        assert any(
+            "Client disconnected mid-stream" in r.message
+            and "req123" in r.message
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_unexpected_stream_error_sanitized_but_logged(
+        self, caplog,
+    ):
+        import logging
+
+        from kllmgate.pipeline import _logged_stream
+
+        async def _chunks():
+            yield "data: partial\n\n"
+            raise RuntimeError("secret stack detail")
+
+        with caplog.at_level(logging.ERROR, logger="kllmgate.pipeline"):
+            out = [
+                chunk async for chunk in _logged_stream(
+                    _chunks(),
+                    "req456",
+                    PF.OPENAI_CHAT,
+                    "test",
+                    "gpt-4",
+                    {},
+                    0.0,
+                )
+            ]
+
+        full = "".join(out)
+        assert "secret stack detail" not in full
+        assert "internal server error" in full
+        assert any(
+            "secret stack detail" in r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.ERROR
+        )
+
+    @pytest.mark.asyncio
+    async def test_upstream_stream_error_message_still_forwarded(self):
+        from kllmgate.errors import UpstreamError
+        from kllmgate.pipeline import _logged_stream
+
+        async def _chunks():
+            raise UpstreamError(
+                "upstream timeout after retries",
+                code="upstream_request_error",
+            )
+            yield  # pragma: no cover
+
+        out = [
+            chunk async for chunk in _logged_stream(
+                _chunks(),
+                "req789",
+                PF.OPENAI_CHAT,
+                "test",
+                "gpt-4",
+                {},
+                0.0,
+            )
+        ]
+        full = "".join(out)
+        assert "upstream timeout after retries" in full
+
+    @pytest.mark.asyncio
+    async def test_conversion_stream_error_message_still_forwarded(self):
+        from kllmgate.errors import ConversionError
+        from kllmgate.pipeline import _logged_stream
+
+        async def _chunks():
+            raise ConversionError(
+                "malformed tool call xml",
+                code="malformed_tool_call",
+            )
+            yield  # pragma: no cover
+
+        out = [
+            chunk async for chunk in _logged_stream(
+                _chunks(),
+                "req-conv",
+                PF.OPENAI_CHAT,
+                "test",
+                "gpt-4",
+                {},
+                0.0,
+            )
+        ]
+        full = "".join(out)
+        assert "malformed tool call xml" in full
+        assert "internal server error" not in full

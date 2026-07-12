@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
 
 from .errors import GatewayError, ProtocolError, format_error_response
 from .models import GatewayConfig, ProtocolFormat
@@ -72,6 +74,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
                 model_aliases=request.app.state.model_aliases,
                 default_provider=request.app.state.default_provider,
                 forward_headers=_extract_forward_headers(request),
+                http_request=request,
             )
         except GatewayError as e:
             return format_error_response(
@@ -94,6 +97,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
                 model_aliases=request.app.state.model_aliases,
                 default_provider=request.app.state.default_provider,
                 forward_headers=_extract_forward_headers(request),
+                http_request=request,
             )
         except GatewayError as e:
             return format_error_response(
@@ -126,6 +130,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
                 model_aliases=request.app.state.model_aliases,
                 default_provider=request.app.state.default_provider,
                 forward_headers=_extract_forward_headers(request),
+                http_request=request,
             )
         except GatewayError as e:
             return format_error_response(
@@ -139,6 +144,44 @@ def create_app(config: GatewayConfig) -> FastAPI:
             request.app.state.providers,
             request.app.state.model_aliases,
             models_list=request.app.state.models_list,
+        )
+
+    @app.get("/health/ready")
+    async def health_ready(request: Request):
+        """就绪探针：并行探测各上游可达性，至少一个可达则 200"""
+        clients: dict[str, UpstreamClient] = (
+            request.app.state.upstream_clients
+        )
+        names = list(clients.keys())
+        results = await asyncio.gather(
+            *(clients[name].check_reachable() for name in names),
+            return_exceptions=True,
+        )
+        providers_status: dict[str, dict] = {}
+        any_ok = False
+        for name, result in zip(names, results, strict=True):
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "Health probe failed for provider %s: %s",
+                    name, result,
+                )
+                providers_status[name] = {
+                    "ok": False,
+                    "detail": "probe_error",
+                }
+                continue
+            ok, detail = result
+            providers_status[name] = {"ok": ok, "detail": detail}
+            if ok:
+                any_ok = True
+
+        ready = bool(clients) and any_ok
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={
+                "status": "ready" if ready else "not_ready",
+                "providers": providers_status,
+            },
         )
 
     @app.api_route(

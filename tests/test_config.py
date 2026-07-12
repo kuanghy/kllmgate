@@ -102,6 +102,39 @@ class TestLoadConfig:
         assert cfg.max_retries == 5
         assert cfg.models == ["model-a", "model-b"]
 
+    def test_thinking_style_loaded_from_config(self, toml_file):
+        path = toml_file("""\
+            [providers.deepseek_r1]
+            base_url = "http://localhost:8000/v1"
+            api_key = "not-needed"
+            protocol = "openai"
+            tool_style = "deepseek"
+            thinking_style = "think"
+        """)
+        config = load_config(path)
+        assert config.providers["deepseek_r1"].thinking_style == "think"
+
+    def test_thinking_style_defaults_to_disabled(self, toml_file):
+        path = toml_file("""\
+            [providers.test]
+            base_url = "https://api.example.com"
+            api_key = "sk-test"
+            protocol = "openai"
+        """)
+        config = load_config(path)
+        assert config.providers["test"].thinking_style == "disabled"
+
+    def test_invalid_thinking_style_raises(self, toml_file):
+        path = toml_file("""\
+            [providers.test]
+            base_url = "https://api.example.com"
+            api_key = "sk-test"
+            protocol = "openai"
+            thinking_style = "bogus"
+        """)
+        with pytest.raises(ConfigError, match="thinking_style"):
+            load_config(path)
+
     def test_base_url_trailing_slash_stripped(self, toml_file):
         path = toml_file("""\
             [providers.test]

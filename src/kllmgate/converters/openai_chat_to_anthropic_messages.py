@@ -181,6 +181,9 @@ class OpenaiChatToAnthropicMessagesConverter(Converter):
     ) -> AsyncIterator[str]:
         resp_id = ""
         model_name = ""
+        # Anthropic content block index → OpenAI tool_calls index
+        tool_index_by_block: dict[int, int] = {}
+        next_tool_index = 0
 
         async for event in upstream_events:
             if not event.event:
@@ -204,6 +207,34 @@ class OpenaiChatToAnthropicMessagesConverter(Converter):
                     }],
                 })
 
+            elif event.event == "content_block_start":
+                block = data.get("content_block", {})
+                if block.get("type") != "tool_use":
+                    continue
+                block_index = data.get("index", next_tool_index)
+                tool_index = next_tool_index
+                tool_index_by_block[block_index] = tool_index
+                next_tool_index += 1
+                yield format_data_only_sse({
+                    "id": resp_id,
+                    "object": "chat.completion.chunk",
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": tool_index,
+                                "id": block.get("id", ""),
+                                "type": "function",
+                                "function": {
+                                    "name": block.get("name", ""),
+                                    "arguments": "",
+                                },
+                            }],
+                        },
+                    }],
+                })
+
             elif event.event == "content_block_delta":
                 delta = data.get("delta", {})
                 if delta.get("type") == "text_delta":
@@ -219,6 +250,8 @@ class OpenaiChatToAnthropicMessagesConverter(Converter):
                         }],
                     })
                 elif delta.get("type") == "input_json_delta":
+                    block_index = data.get("index", 0)
+                    tool_index = tool_index_by_block.get(block_index, 0)
                     yield format_data_only_sse({
                         "id": resp_id,
                         "object": "chat.completion.chunk",
@@ -227,7 +260,7 @@ class OpenaiChatToAnthropicMessagesConverter(Converter):
                             "index": 0,
                             "delta": {
                                 "tool_calls": [{
-                                    "index": 0,
+                                    "index": tool_index,
                                     "function": {
                                         "arguments": delta.get(
                                             "partial_json", "",
